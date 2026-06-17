@@ -80,6 +80,10 @@ async def listen(
     dedup = Dedup()
     proc = await asyncio.create_subprocess_exec(
         "lark-cli", "event", "consume", EVENT_KEY, "--as", "bot",
+        # ★ 保持 stdin 开：lark-cli 把 stdin 的 EOF 当退出信号（为 AI 子进程调用设计）。
+        #   launchd 后台跑时父进程 stdin 是 /dev/null（EOF），不给 PIPE 的话 consume 一启动就退出
+        #   → supervisor 死循环重启。给个 PIPE 且永不写/不关，stdin 就一直开着；停止用 proc.terminate()。
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
