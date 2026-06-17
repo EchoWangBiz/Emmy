@@ -24,6 +24,7 @@ from core import listener, claude_runner, reply  # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_FILE = os.path.join(PROJECT_DIR, "prompts", "emmy_system.md")
+ABILITIES_DIR = os.path.join(PROJECT_DIR, "prompts", "abilities")
 
 # 收到消息先秒回一句（H1 两段式）——随机挑一句，更像活泼爱俏皮的小 Emmy
 ACK_REPLIES = [
@@ -43,11 +44,20 @@ _seen_chats: set = set()
 
 
 def load_system_prompt() -> str:
+    """人设 + 所有能力模块（prompts/abilities/*.md）拼成 system prompt。
+    可插拔能力层：加新能力 = 往 abilities/ 放个 .md，不用改代码。"""
+    parts = []
     try:
         with open(SYSTEM_PROMPT_FILE, encoding="utf-8") as f:
-            return f.read()
+            parts.append(f.read())
     except FileNotFoundError:
-        return ""  # 还没写人设也能跑
+        pass  # 还没写人设也能跑
+    if os.path.isdir(ABILITIES_DIR):
+        for name in sorted(os.listdir(ABILITIES_DIR)):
+            if name.endswith(".md"):
+                with open(os.path.join(ABILITIES_DIR, name), encoding="utf-8") as f:
+                    parts.append(f.read())
+    return "\n\n---\n\n".join(parts)
 
 
 async def handle(msg: dict, system_prompt: str) -> None:
