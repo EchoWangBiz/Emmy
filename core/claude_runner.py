@@ -69,6 +69,27 @@ def parse_result(stdout: str) -> dict:
     }
 
 
+async def _invoke(
+    prompt: str, sid: str, *, resume: bool,
+    system_prompt: str, cwd: Optional[str], env: Optional[dict], timeout: int,
+) -> dict:
+    """实际跑一次 claude；总是带回 raw_stderr（自愈判断 + 诊断都要用）。"""
+    cmd = build_cmd(prompt, sid, resume=resume, system_prompt=system_prompt)
+    proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=env, stdout=PIPE, stderr=PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {"ok": False, "is_error": True, "text": "（处理超时，请稍后再试）",
+                "error": "timeout", "session_id": sid, "cost_usd": 0.0, "raw_stderr": ""}
+    res = parse_result(out.decode("utf-8", "replace"))
+    res["raw_stderr"] = (err.decode("utf-8", "replace")[:1500] if err else "")
+    if res["is_error"] and res.get("error") == "无法解析 claude 输出":
+        res["raw_stdout"] = out.decode("utf-8", "replace")[:1500]
+        res["returncode"] = proc.returncode
+    return res
+
+
 async def run(
     prompt: str,
     chat_id: str,
@@ -79,22 +100,24 @@ async def run(
     env: Optional[dict] = None,
     timeout: int = 180,
 ) -> dict:
-    """调一次 claude，返回 parse_result 的结构（含超时兜底）。"""
+    """调 claude（带 session 自愈）。
+
+    session_id 按 chat_id 确定性派生；但"是否已建过 session"的判断是内存的，
+    重启后会丢 → 可能对已存在 session 误用 --session-id（报 "already in use"），
+    或对不存在 session 误用 --resume。这里检测到不一致就自动切换模式重试一次。
+    """
     sid = session_id_for(chat_id)
-    cmd = build_cmd(prompt, sid, resume=resume, system_prompt=system_prompt)
-    proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=env, stdout=PIPE, stderr=PIPE)
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return {"ok": False, "is_error": True, "text": "（处理超时，请稍后再试）",
-                "error": "timeout", "session_id": sid, "cost_usd": 0.0}
-    res = parse_result(out.decode("utf-8", "replace"))
-    if res["is_error"] and res.get("error") == "无法解析 claude 输出":
-        # 诊断：解析失败时带回原始 stdout/stderr，方便定位 claude 到底吐了啥
-        res["raw_stdout"] = out.decode("utf-8", "replace")[:1500]
-        res["raw_stderr"] = (err.decode("utf-8", "replace")[:1500] if err else "")
-        res["returncode"] = proc.returncode
+    res = await _invoke(prompt, sid, resume=resume,
+                        system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout)
+    stderr = res.get("raw_stderr") or ""
+    if res["is_error"] and "already in use" in stderr and not resume:
+        # 想新建但 session 已存在 → 改 --resume 续接
+        res = await _invoke(prompt, sid, resume=True,
+                            system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout)
+    elif res["is_error"] and "No conversation found" in stderr and resume:
+        # 想续接但 session 不存在 → 改 --session-id 新建
+        res = await _invoke(prompt, sid, resume=False,
+                            system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout)
     return res
 
 
