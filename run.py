@@ -75,6 +75,11 @@ async def handle(msg: dict, system_prompt: str) -> None:
     res = await claude_runner.run(
         content, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
     if res["is_error"]:
+        # 终端打印详细诊断（"无法解析"时把 claude 原始输出也打出来，方便排查）
+        print(f"[run] ⚠️ claude 出错: {res.get('error')} (returncode={res.get('returncode')})", flush=True)
+        if res.get("raw_stdout") is not None:
+            print("[run] ---- claude raw stdout ----\n" + (res.get("raw_stdout") or "(空)"), flush=True)
+            print("[run] ---- claude stderr ----\n" + (res.get("raw_stderr") or "(空)"), flush=True)
         text = "（出错了：%s）" % (res.get("error") or res.get("text") or "未知")
     else:
         text = res["text"] or "（没有返回内容）"

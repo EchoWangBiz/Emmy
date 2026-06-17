@@ -84,12 +84,18 @@ async def run(
     cmd = build_cmd(prompt, sid, resume=resume, system_prompt=system_prompt)
     proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=env, stdout=PIPE, stderr=PIPE)
     try:
-        out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         return {"ok": False, "is_error": True, "text": "（处理超时，请稍后再试）",
                 "error": "timeout", "session_id": sid, "cost_usd": 0.0}
-    return parse_result(out.decode("utf-8", "replace"))
+    res = parse_result(out.decode("utf-8", "replace"))
+    if res["is_error"] and res.get("error") == "无法解析 claude 输出":
+        # 诊断：解析失败时带回原始 stdout/stderr，方便定位 claude 到底吐了啥
+        res["raw_stdout"] = out.decode("utf-8", "replace")[:1500]
+        res["raw_stderr"] = (err.decode("utf-8", "replace")[:1500] if err else "")
+        res["returncode"] = proc.returncode
+    return res
 
 
 async def healthcheck() -> bool:
