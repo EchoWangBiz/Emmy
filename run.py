@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,6 +24,19 @@ from core import listener, claude_runner, reply  # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_FILE = os.path.join(PROJECT_DIR, "prompts", "emmy_system.md")
+
+# 收到消息先秒回一句（H1 两段式）——随机挑一句，更像活泼爱俏皮的小 Emmy
+ACK_REPLIES = [
+    "好嘞！🦊",
+    "好的呀~",
+    "Okkk~",
+    "收到收到！",
+    "嗯嗯，这就来~",
+    "马上办！✨",
+    "好哒~ 🐾",
+    "包在我身上！",
+    "在的在的~",
+]
 
 # 记录哪些 chat 已开过 session（用于 --resume 续聊）
 _seen_chats: set = set()
@@ -44,8 +58,8 @@ async def handle(msg: dict, system_prompt: str) -> None:
     resume = chat_id in _seen_chats
     _seen_chats.add(chat_id)
 
-    # H1 两段式响应：先秒回"处理中"，避免用户以为机器人挂了
-    await reply.send(chat_id, "🦊 收到，处理中…",
+    # H1 两段式响应：先随机秒回一句，避免用户以为机器人挂了（也更有 Emmy 的活泼劲儿）
+    await reply.send(chat_id, random.choice(ACK_REPLIES),
                      idempotency_key=(msg.get("event_id") or "") + ":ack")
 
     res = await claude_runner.run(
