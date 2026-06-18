@@ -135,6 +135,12 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
 **还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
 
 对方刚说：__CONTENT__"""
+    cc = config.chat_config(chat_id) or {}
+    if cc.get("base_app_token") or cc.get("repo"):
+        # 之前配过但没走完初始化：把已知的告诉 Emmy，别重新问，只补缺的 + 自检表/自动化
+        content += ("\n\n【这个群之前配过一部分，已知：base_app_token=%s, base_table_id=%s, repo=%s】"
+                    "——已知的直接用、别重新问；只补缺的，重点是自检补全表 schema + 扫自动化，齐了就吐带 initialized 的块。"
+                    % (cc.get("base_app_token") or "(无)", cc.get("base_table_id") or "(无)", cc.get("repo") or "(无)"))
     return tpl.replace("__CID__", chat_id).replace("__CONTENT__", content)
 
 
