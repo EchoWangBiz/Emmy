@@ -20,7 +20,7 @@ import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from core import listener, claude_runner, reply  # noqa: E402
+from core import listener, claude_runner, reply, config  # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_FILE = os.path.join(PROJECT_DIR, "prompts", "emmy_system.md")
@@ -60,6 +60,22 @@ def load_system_prompt() -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _with_chat_context(chat_id: str, content: str) -> str:
+    """注入当前群的配置上下文（角色/表/repo），Emmy 据此认群、认活。没配该群则原样返回。"""
+    cc = config.chat_config(chat_id)
+    if not cc:
+        return content
+    lines = ["[当前群上下文]"]
+    if cc.get("role"):
+        lines.append("- 群角色: %s" % cc["role"])
+    if cc.get("base_app_token"):
+        lines.append("- BUG表 base-token: %s  table-id: %s"
+                     % (cc["base_app_token"], cc.get("base_table_id", "")))
+    if cc.get("repo"):
+        lines.append("- 项目 repo: %s" % cc["repo"])
+    return "\n".join(lines) + "\n\n" + content
+
+
 async def handle(msg: dict, system_prompt: str) -> None:
     chat_id = msg["chat_id"]
     content = (msg.get("content") or "").strip()
@@ -73,7 +89,8 @@ async def handle(msg: dict, system_prompt: str) -> None:
                      idempotency_key=(msg.get("event_id") or "") + ":ack")
 
     res = await claude_runner.run(
-        content, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
+        _with_chat_context(chat_id, content), chat_id,
+        resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
     if res["is_error"]:
         # 终端打印详细诊断（"无法解析"时把 claude 原始输出也打出来，方便排查）
         print(f"[run] ⚠️ claude 出错: {res.get('error')} (returncode={res.get('returncode')})", flush=True)
