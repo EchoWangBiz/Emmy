@@ -76,13 +76,26 @@ def parse_worker_reply(text: str) -> dict:
 
 
 # ---------------- lark-cli 读写表格 ----------------
-async def _lark_json(args: list) -> Optional[dict]:
+def _lark_success(d) -> bool:
+    """lark-cli --format json 输出的成功标志（ok!=False 且 code in (0,None)）。"""
+    if not isinstance(d, dict):
+        return False
+    return d.get("ok") is not False and d.get("code") in (0, None)
+
+
+async def _lark_json(args: list) -> tuple:
+    """跑 lark-cli，返回 (ok, data)。ok = returncode==0 且 lark 返回成功；失败打印诊断、绝不静默吞。"""
     proc = await asyncio.create_subprocess_exec("lark-cli", *args, stdout=PIPE, stderr=PIPE)
-    out, _ = await proc.communicate()
+    out, err = await proc.communicate()
     try:
-        return json.loads(out.decode("utf-8", "replace"))
+        d = json.loads(out.decode("utf-8", "replace"))
     except json.JSONDecodeError:
-        return None
+        d = None
+    ok = proc.returncode == 0 and _lark_success(d)
+    if not ok:
+        detail = err.decode("utf-8", "replace")[:200] if err else (str(d)[:200] if d else "(无输出)")
+        print("[worker] lark-cli 失败 rc=%s: %s" % (proc.returncode, detail), flush=True)
+    return ok, d
 
 
 def build_list_cmd(base_token: str, table_id: str) -> list:
@@ -130,12 +143,14 @@ def pending_records(listing: dict) -> list:
 
 
 async def read_pending(base_token: str, table_id: str) -> list:
-    listing = await _lark_json(build_list_cmd(base_token, table_id))
+    _ok, listing = await _lark_json(build_list_cmd(base_token, table_id))
     return pending_records(listing or {})
 
 
-async def write_back(base_token: str, table_id: str, record_id: str, patch: dict) -> None:
-    await _lark_json(build_update_cmd(base_token, table_id, [record_id], patch))
+async def write_back(base_token: str, table_id: str, record_id: str, patch: dict) -> bool:
+    """回写一条记录；成功返回 True（失败已在 _lark_json 打印，调用方据此决定是否报假成功）。"""
+    ok, _ = await _lark_json(build_update_cmd(base_token, table_id, [record_id], patch))
+    return ok
 
 
 # ---------------- 修完回群通知 + @提问人 ----------------
@@ -165,15 +180,16 @@ def _result_message(at: str, num: str, r: dict) -> str:
     return "#%s 我处理了一下但没完全搞定，麻烦人工看一眼~" % num
 
 
-async def _send_group(chat_id: str, text: str) -> None:
-    await _lark_json(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
-                      "--msg-type", "text",
-                      "--content", json.dumps({"text": text}, ensure_ascii=False)])
+async def _send_group(chat_id: str, text: str) -> bool:
+    ok, _ = await _lark_json(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
+                              "--msg-type", "text",
+                              "--content", json.dumps({"text": text}, ensure_ascii=False)])
+    return ok
 
 
 async def notify_results(chat_id: str, results: list) -> None:
     """results: [(rec, fix_result)]。逐条发群通知 + @提问人。"""
-    members = await _lark_json(["im", "chat.members", "get", "--chat-id", chat_id, "--format", "json"])
+    _ok, members = await _lark_json(["im", "chat.members", "get", "--chat-id", chat_id, "--format", "json"])
     items = (((members or {}).get("data") or {}).get("items")) or (members or {}).get("items") or []
     for rec, r in results:
         f = rec.get("fields") or {}
@@ -350,6 +366,11 @@ def _selftest() -> None:
     payload = json.loads(uc[uc.index("--json") + 1])
     assert payload["record_id_list"] == ["rec_1"] and payload["patch"]["状态"] == "待发布"
     print("✓ lark-cli 命令构造（--base-token / record_id_list+patch）")
+
+    # _lark_success：ok=false / code!=0 判失败，其余成功
+    assert _lark_success({"ok": True, "data": {}}) and _lark_success({"code": 0})
+    assert not _lark_success({"ok": False}) and not _lark_success({"code": 99}) and not _lark_success(None)
+    print("✓ _lark_success 判 lark-cli 成败（不再静默吞错）")
 
     # 4) pending_records 过滤 状态=待修复
     listing = {"data": {"items": [
