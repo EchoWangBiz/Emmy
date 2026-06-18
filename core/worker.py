@@ -33,6 +33,9 @@ WORKER_ALLOWED = ("Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(yarn:*) Bash(pnpm:*) 
 WORKER_DISALLOWED = ["Bash(rm:*)", "Bash(sudo:*)", "Bash(curl:*)", "Bash(ssh:*)", "Bash(git push origin dev:*)"]
 
 STATUS_FIELD = "状态"
+# worker 回写要用到的字段 + 状态选项；开工前校验这些齐不齐，缺了就别白跑一趟
+NEED_FIELDS = ("状态", "修复分支/PR", "AI备注", "待确认问题")
+NEED_STATUS_OPTIONS = ("待修复", "修复中", "待人工确认", "待发布")
 # worker 的 worktree 一律开在【目标 repo 外】的 Emmy 自管目录，绝不在目标项目里留临时目录
 WORKTREE_BASE = os.path.expanduser("~/.emmy/worktrees")
 
@@ -151,6 +154,24 @@ async def write_back(base_token: str, table_id: str, record_id: str, patch: dict
     """回写一条记录；成功返回 True（失败已在 _lark_json 打印，调用方据此决定是否报假成功）。"""
     ok, _ = await _lark_json(build_update_cmd(base_token, table_id, [record_id], patch))
     return ok
+
+
+def _schema_gaps(field_list_data: dict) -> tuple:
+    """从 field-list 的 data 算出 (缺的字段, 状态字段缺的选项)。纯函数，便于单测。"""
+    fields = (field_list_data or {}).get("fields") or []
+    names = {(f.get("name") or f.get("field_name")) for f in fields}
+    missing_fields = [n for n in NEED_FIELDS if n not in names]
+    status = next((f for f in fields if (f.get("name") or f.get("field_name")) == STATUS_FIELD), None)
+    opts = {o.get("name") for o in (status.get("options") or [])} if status else set()
+    missing_options = [o for o in NEED_STATUS_OPTIONS if o not in opts]
+    return missing_fields, missing_options
+
+
+async def check_table_schema(base_token: str, table_id: str) -> tuple:
+    """读 field-list，返回 (缺字段, 缺状态选项)——worker 开工前校验，缺了别白跑。"""
+    _ok, d = await _lark_json(["base", "+field-list", "--base-token", base_token,
+                               "--table-id", table_id, "--format", "json"])
+    return _schema_gaps((d or {}).get("data") or {})
 
 
 # ---------------- 修完回群通知 + @提问人 ----------------
@@ -305,6 +326,18 @@ async def run_worker(chat_id: str) -> list:
     base_token, table_id, repo = cc.get("base_app_token"), cc.get("base_table_id"), cc.get("repo")
     if not all([base_token, table_id, repo]):
         print("emmy.yaml 缺 base_app_token/base_table_id/repo")
+        return []
+    # 开工前置硬校验：表格缺字段/缺状态选项就别白跑一趟，回群精确指出让群主补
+    missing_f, missing_o = await check_table_schema(base_token, table_id)
+    if missing_f or missing_o:
+        parts = []
+        if missing_f:
+            parts.append("缺字段「%s」" % "、".join(missing_f))
+        if missing_o:
+            parts.append("状态缺选项「%s」" % "、".join(missing_o))
+        print("[worker] 表格 schema 不全，未开张:", missing_f, missing_o)
+        await _send_group(chat_id, "开工前发现表格还没配齐——%s。群主在多维表格补一下，我就能跑、也能正常回写状态啦 🦊"
+                          % "；".join(parts))
         return []
     try:
         paired = []
@@ -467,6 +500,17 @@ def _selftest() -> None:
     gh = _mr_url("https://github.com/o/r", "bugfix/0006")
     assert "/compare/dev...bugfix%2F0006" in gh, gh
     print("✓ _mr_url 框架构造 MR/PR 链接（GitLab/GitHub）")
+
+    # 9) _schema_gaps：缺字段 + 缺状态选项 / 齐全
+    mf, mo = _schema_gaps({"fields": [
+        {"name": "状态", "options": [{"name": "待修复"}, {"name": "修复中"}]},
+        {"name": "问题编号"}]})
+    assert "修复分支/PR" in mf and "AI备注" in mf and "待确认问题" in mf, mf
+    assert "待发布" in mo and "待人工确认" in mo and "待修复" not in mo, mo
+    full = {"fields": [{"name": "状态", "options": [{"name": o} for o in NEED_STATUS_OPTIONS]},
+                       {"name": "修复分支/PR"}, {"name": "AI备注"}, {"name": "待确认问题"}]}
+    assert _schema_gaps(full) == ([], []), _schema_gaps(full)
+    print("✓ _schema_gaps 校验缺字段/缺状态选项（开工前置）")
 
     print("\nworker 纯逻辑自测全部通过 ✅（端到端真改代码需 emmy.yaml 配好 MASS repo 后一起测）")
 
