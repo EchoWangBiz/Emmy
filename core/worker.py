@@ -49,8 +49,10 @@ def build_fix_prompt(bug: dict, base_branch: str = "dev") -> str:
         "1. 读懂相关代码、定位问题根因。\n"
         "2. 在【当前分支】改代码修复（已是独立 bugfix 分支）。\n"
         "3. git add + git commit（message 写清改了啥）。\n"
-        "4. git push -u origin <当前分支>，再 gh pr create --base %s 提 PR。\n"
-        "   ⚠️ 绝对不要 merge 到 %s、不要 push %s/main —— 只提 PR，停在这等人 review。\n"
+        "4. 提交后推分支：git push -u origin <当前分支>。\n"
+        "   - GitLab 仓库：push 输出里有一行带 merge request 的链接，把它当 PR 链接用；拿不到就写『分支已推，去开 MR』。\n"
+        "   - GitHub 仓库（且有 gh）：gh pr create --base %s 提 PR。\n"
+        "   ⚠️ 绝不 merge 到 %s、绝不 push %s/main、绝不自己合 MR/PR —— 只到『可 review』就停下等人。\n"
         "5. 遇到【拿不准/高风险/需求不清】→【不要硬改】，停下，把问题讲清楚。\n\n"
         "最后一行必须是下面两种之一(便于我解析)：\n"
         "  DONE: <PR链接> | <一句话改了啥>\n"
@@ -303,9 +305,9 @@ def _selftest() -> None:
     # 1) build_fix_prompt 含关键约束
     p = build_fix_prompt({"编号": "0009", "摘要": "登录报错", "详情": "点登录→403"})
     assert "0009" in p and "登录报错" in p
-    assert "只提 PR" in p and "DONE:" in p and "BLOCKED:" in p
-    assert "不要 merge" in p
-    print("✓ build_fix_prompt 含 BUG 信息 + 只提PR约束 + 输出契约")
+    assert "DONE:" in p and "BLOCKED:" in p
+    assert "绝不 merge" in p and "可 review" in p and "merge request" in p  # GitLab/GitHub 通用、不自动合
+    print("✓ build_fix_prompt 含 BUG 信息 + 只到可review约束 + GitLab友好 + 输出契约")
 
     # 2) parse_worker_reply
     assert parse_worker_reply("...\nDONE: https://x/pr/1 | 修了登录")["outcome"] == "done"
