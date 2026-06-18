@@ -307,15 +307,20 @@ async def run_worker(chat_id: str) -> list:
         print("emmy.yaml 缺 base_app_token/base_table_id/repo")
         return []
     try:
-        pend = await read_pending(base_token, table_id)
-        print("待修复 %d 条" % len(pend))
         paired = []
-        for rec in pend:  # 串行：一条条修，稳
-            bug = _field(rec.get("fields") or {})
-            await _send_group(chat_id, "#%s 我开始改了，大概几分钟，改完 @你~ 🛠️" % bug["编号"])  # 开工播报
-            r = await fix_one(rec, repo, base_token, table_id)
-            paired.append((rec, r))
-            print("  ->", r)
+        seen = set()  # 已处理过的 record_id，防写状态失败时同一条被无限重修
+        for _round in range(20):  # 处理完一批后再扫一次，接住期间新标「待修复」的（让"排上了"成真）；上限防失控
+            pend = [r for r in await read_pending(base_token, table_id) if r["record_id"] not in seen]
+            if not pend:
+                break
+            print("待修复 %d 条（第 %d 轮）" % (len(pend), _round + 1))
+            for rec in pend:  # 串行：一条条修，稳
+                seen.add(rec["record_id"])
+                bug = _field(rec.get("fields") or {})
+                await _send_group(chat_id, "#%s 我开始改了，大概几分钟，改完 @你~ 🛠️" % bug["编号"])  # 开工播报
+                r = await fix_one(rec, repo, base_token, table_id)
+                paired.append((rec, r))
+                print("  ->", r)
         if paired:
             await notify_results(chat_id, paired)  # 修完回群通知 + @提问人（闭环最后一步）
         return [r for _, r in paired]
