@@ -33,6 +33,8 @@ WORKER_ALLOWED = ("Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(yarn:*) Bash(pnpm:*) 
 WORKER_DISALLOWED = ["Bash(rm:*)", "Bash(sudo:*)", "Bash(curl:*)", "Bash(ssh:*)", "Bash(git push origin dev:*)"]
 
 STATUS_FIELD = "状态"
+# worker 的 worktree 一律开在【目标 repo 外】的 Emmy 自管目录，绝不在目标项目里留临时目录
+WORKTREE_BASE = os.path.expanduser("~/.emmy/worktrees")
 
 
 # ---------------- prompt ----------------
@@ -150,7 +152,10 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
 
     top = loc["toplevel"]
     branch = "bugfix/%s" % bug["编号"]
-    wt = os.path.join(top, ".emmy-worktrees", branch.replace("/", "-"))
+    # worktree 开到目标 repo 外（~/.emmy/worktrees/<repo>/<branch>），不污染目标项目
+    repo_key = loc["url"].replace("https://", "").replace("/", "__")
+    wt = os.path.join(WORKTREE_BASE, repo_key, branch.replace("/", "-"))
+    os.makedirs(os.path.dirname(wt), exist_ok=True)
     repo_locate.remove_worktree(top, wt)  # 清残留
     ok, msg = repo_locate.make_worktree(top, branch, wt, base="dev")
     if not ok:

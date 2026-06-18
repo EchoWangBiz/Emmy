@@ -16,6 +16,7 @@ prompts/emmy_system.md
 logs/
 *.plist
 .emmy/
+.emmy-worktrees/
 data/
 
 # ── Python ──────────────────────────────────────────────
