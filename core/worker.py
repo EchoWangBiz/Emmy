@@ -203,6 +203,54 @@ async def run_worker(chat_id: str) -> list:
     return results
 
 
+async def check_ready(chat_id: str) -> None:
+    """端到端测试前的就绪自检：配置 / repo / dev分支 / claude / gh / 待修复数。"""
+    import subprocess
+    print("🔎 worker 就绪自检 — chat %s\n" % chat_id)
+    ok = True
+    cc = config.chat_config(chat_id)
+    if not cc:
+        print("  ✗ emmy.yaml 没配这个群（在 chats 下加 %s:）" % chat_id)
+        return
+    if cc.get("role") != "fix-bug":
+        print("  ✗ 该群 role 不是 fix-bug"); ok = False
+    miss = [k for k in ("base_app_token", "base_table_id", "repo") if not cc.get(k)]
+    if miss:
+        print("  ✗ 群配置缺: %s" % ", ".join(miss)); ok = False
+    else:
+        print("  ✓ 群配置齐全（role/base/repo）")
+
+    repo = cc.get("repo")
+    loc = repo_locate.locate(repo) if repo else None
+    if loc:
+        print("  ✓ 项目定位: %s" % loc["url"])
+        r = subprocess.run(["git", "-C", loc["toplevel"], "rev-parse", "--verify", "dev"],
+                           capture_output=True)
+        print("  ✓ dev 分支存在" if r.returncode == 0
+              else "  ✗ 没有 dev 分支（worker 从 dev 切子分支）")
+        ok = ok and r.returncode == 0
+    elif repo:
+        print("  ✗ repo 路径不是有效 git 仓库: %s" % repo); ok = False
+
+    cp = subprocess.run(["claude", "-p", "ok", "--output-format", "json"],
+                        capture_output=True, text=True)
+    if '"is_error":false' in cp.stdout.replace(" ", ""):
+        print("  ✓ claude 登录可用")
+    else:
+        print("  ✗ claude 未登录（claude / claude setup-token）"); ok = False
+
+    gh = subprocess.run(["gh", "auth", "status"], capture_output=True)
+    print("  ✓ gh 已认证" if gh.returncode == 0 else "  ✗ gh 未认证（gh auth login，提 PR 用）")
+    ok = ok and gh.returncode == 0
+
+    if not miss:
+        pend = await read_pending(cc["base_app_token"], cc["base_table_id"])
+        print("  ✓ 待修复 %d 条" % len(pend))
+
+    print("\n%s" % (("✅ 就绪！可以 python core/worker.py %s 真跑了" % chat_id)
+                    if ok else "⚠️ 上面有 ✗，处理后再跑"))
+
+
 # ---------------- 自测（python3 core/worker.py --selftest）----------------
 def _selftest() -> None:
     # 1) build_fix_prompt 含关键约束
@@ -249,7 +297,12 @@ def _selftest() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         _selftest()
-    elif len(sys.argv) > 1:
+    elif len(sys.argv) > 2 and sys.argv[1] == "--check":
+        asyncio.run(check_ready(sys.argv[2]))
+    elif len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         asyncio.run(run_worker(sys.argv[1]))
     else:
-        print("用法: python core/worker.py <chat_id>  |  python core/worker.py --selftest")
+        print("用法:\n"
+              "  python core/worker.py --check <chat_id>   # 就绪自检（测试前先跑这个）\n"
+              "  python core/worker.py <chat_id>           # 真跑修复\n"
+              "  python core/worker.py --selftest          # 纯逻辑自测")
