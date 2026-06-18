@@ -73,6 +73,53 @@ def chat_config(chat_id: str, cfg: Optional[dict] = None) -> Optional[dict]:
     return chats.get(chat_id)
 
 
+# ---------------- 受控写入（配置门禁用）----------------
+# 说明：Emmy 大脑【没有写文件权限】，群配置由框架（run.py）在收到 Emmy 收集好的
+# 结构化结果后，调用这里写入——只动 emmy.yaml 的 chats[chat_id]，碰不到别的文件。
+
+def _quote(v) -> str:
+    """需要时给标量加双引号（含空格/冒号/引号、或首尾空格才加），保证 mini parser 也能读回。"""
+    s = str(v)
+    if s == "" or s != s.strip() or any(c in s for c in ': "'):
+        return '"%s"' % s.replace('"', '\\"')
+    return s
+
+
+def _dump_yaml(cfg: dict) -> str:
+    """把 emmy.yaml 这种「chats 嵌套 dict + defaults」结构序列化回 YAML（与 _mini_yaml 配对）。"""
+    out = []
+    chats = cfg.get("chats") or {}
+    out.append("chats:")
+    for cid, c in chats.items():
+        out.append("  %s:" % cid)
+        for k, v in (c or {}).items():
+            out.append("    %s: %s" % (k, _quote(v)))
+    defaults = cfg.get("defaults")
+    if defaults:
+        out.append("defaults:")
+        for k, v in defaults.items():
+            out.append("  %s: %s" % (k, _quote(v)))
+    return "\n".join(out) + "\n"
+
+
+def set_chat_config(chat_id: str, chat_cfg: dict, path: Optional[str] = None) -> str:
+    """把某群的配置写入 emmy.yaml（合并：只更新该群、空值不覆盖）。原子写。返回文件路径。"""
+    p = path or _CONFIG_FILE
+    full = load_config(p)
+    if not isinstance(full, dict):
+        full = {}
+    full.setdefault("chats", {})
+    merged = dict(full["chats"].get(chat_id) or {})
+    merged.update({k: v for k, v in (chat_cfg or {}).items() if v not in (None, "")})
+    full["chats"][chat_id] = merged
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# Emmy 配置（部分由飞书 @对话自动写入，可手改；本文件不入库）\n")
+        f.write(_dump_yaml(full))
+    os.replace(tmp, p)
+    return p
+
+
 # ---------------- 自测（python3 core/config.py）----------------
 def _selftest() -> None:
     sample = (
@@ -99,6 +146,30 @@ def _selftest() -> None:
 
     assert load_config("/no/such/emmy.yaml") == {}
     print("✓ 无配置文件返回空 dict")
+
+    # 写读往返（临时文件，不碰真 emmy.yaml）：门禁写入 → 重新解析能读回
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), "emmy_cfg_selftest.yaml")
+    try:
+        set_chat_config("oc_new", {
+            "name": "MASS 内测群", "role": "fix-bug",
+            "base_app_token": "bascn_demo", "base_table_id": "tbl_demo",
+            "repo": "/Users/echo/project/mass",
+        }, path=tmp)
+        back = load_config(tmp)
+        cc2 = chat_config("oc_new", back)
+        assert cc2 and cc2["role"] == "fix-bug" and cc2["repo"] == "/Users/echo/project/mass", cc2
+        assert cc2["name"] == "MASS 内测群", cc2  # 含空格的值加引号后仍能读回
+        # 二次写：合并、不丢已有字段、空值不覆盖
+        set_chat_config("oc_new", {"base_table_id": "tbl_changed", "repo": ""}, path=tmp)
+        cc3 = chat_config("oc_new", load_config(tmp))
+        assert cc3["base_table_id"] == "tbl_changed", cc3       # 改了的生效
+        assert cc3["repo"] == "/Users/echo/project/mass", cc3   # 空值没覆盖
+        assert cc3["role"] == "fix-bug", cc3                    # 没传的字段还在
+        print("✓ set_chat_config 写读往返 + 合并/空值不覆盖")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
     print("\nconfig 解析自测全部通过 ✅")
 

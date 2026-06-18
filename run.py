@@ -15,8 +15,10 @@ run.py —— Emmy 主进程
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +78,57 @@ def _with_chat_context(chat_id: str, content: str) -> str:
     return "\n".join(lines) + "\n\n" + content
 
 
+# ── 配置门禁：群没配过时，Emmy 先对话式问全配置；框架接住结果写 emmy.yaml ──
+# Emmy 大脑没有写文件权限，只负责【收集 + 在回复末尾吐出 <EMMY_CONFIG> 块】，
+# 真正落盘由这里的框架代码做（只写 emmy.yaml 的 chats[chat_id]，碰不到别的文件）。
+_CONFIG_RE = re.compile(r"<EMMY_CONFIG>\s*(\{.*?\})\s*</EMMY_CONFIG>", re.S)
+_ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo")
+
+
+def _onboard_prompt(chat_id: str, content: str) -> str:
+    """群未配置时给 Emmy 的引导：对话式问全配置，齐了再吐 <EMMY_CONFIG> 块。"""
+    return (
+        "[配置门禁] 这个群我还没配置过（chat_id=%s）。配好之前我的首要任务是"
+        "【引导主人一次性把配置说清楚】，先别急着干别的活。\n"
+        "用我自己活泼的口吻、一次性（别一条条挤牙膏）问全这几样：\n"
+        "1) 这个群想让我干啥？目前我会的是【修 BUG】(role=fix-bug)。\n"
+        "2) 如果是修 BUG，还要两样：\n"
+        "   - BUG 多维表格的【分享链接】发我。链接形如\n"
+        "     https://xxx.feishu.cn/base/<app_token>?table=<table_id>&view=...\n"
+        "     我自己从链接里取 app_token 和 table_id，不用主人手填。\n"
+        "   - 代码项目在主人电脑上的【绝对路径】（已经 clone 好的那个，例如 /Users/xxx/project/mass）。\n"
+        "信息没给齐就继续追问，【绝不瞎编/猜测/填占位符】。\n"
+        "等齐全了，在【那一条回复的最末尾】附上这个块（主人看不到它，我的框架会接住写进配置）：\n"
+        "<EMMY_CONFIG>{\"name\":\"群备注\",\"role\":\"fix-bug\",\"base_app_token\":\"...\","
+        "\"base_table_id\":\"...\",\"repo\":\"/绝对/路径\"}</EMMY_CONFIG>\n"
+        "信息还没齐就【绝对不要】输出这个块。\n\n"
+        "主人刚说：%s" % (chat_id, content)
+    )
+
+
+def _maybe_save_config(chat_id: str, text: str) -> str:
+    """门禁模式下：若 Emmy 回复里带 <EMMY_CONFIG> 块，解析并落盘，再从给用户的回复里抹掉它。"""
+    m = _CONFIG_RE.search(text)
+    if not m:
+        return text
+    cleaned = (text[:m.start()] + text[m.end():]).strip()
+    try:
+        cfg = json.loads(m.group(1))
+    except Exception as e:  # noqa: BLE001
+        print(f"[run] ⚠️ 门禁配置块解析失败: {e}", flush=True)
+        return cleaned or text  # 至少别把原始 JSON 块发给用户
+    allowed = {k: cfg[k] for k in _ALLOWED_KEYS if cfg.get(k)}
+    if not allowed.get("role"):
+        return cleaned or text
+    try:
+        path = config.set_chat_config(chat_id, allowed)
+        print(f"[run] ✓ 已写入群配置 {chat_id} -> {path}: {allowed}", flush=True)
+        return (cleaned + "\n\n（配置我记好啦~ 以后这个群直接喊我干活就行 🦊）").strip()
+    except Exception as e:  # noqa: BLE001
+        print(f"[run] ⚠️ 写配置失败: {e}", flush=True)
+        return cleaned or text
+
+
 async def handle(msg: dict, system_prompt: str) -> None:
     chat_id = msg["chat_id"]
     content = (msg.get("content") or "").strip()
@@ -88,9 +141,12 @@ async def handle(msg: dict, system_prompt: str) -> None:
     await reply.send(chat_id, random.choice(ACK_REPLIES),
                      idempotency_key=(msg.get("event_id") or "") + ":ack")
 
+    # 配置门禁：群没配过 → 走引导收集；配好了 → 注入群上下文正常干活
+    cc = config.chat_config(chat_id)
+    prompt = _with_chat_context(chat_id, content) if cc else _onboard_prompt(chat_id, content)
+
     res = await claude_runner.run(
-        _with_chat_context(chat_id, content), chat_id,
-        resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
+        prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
     if res["is_error"]:
         # 终端打印详细诊断（"无法解析"时把 claude 原始输出也打出来，方便排查）
         print(f"[run] ⚠️ claude 出错: {res.get('error')} (returncode={res.get('returncode')})", flush=True)
@@ -100,6 +156,8 @@ async def handle(msg: dict, system_prompt: str) -> None:
         text = "（出错了：%s）" % (res.get("error") or res.get("text") or "未知")
     else:
         text = res["text"] or "（没有返回内容）"
+        if not cc:  # 仅门禁模式才接住配置块并落盘
+            text = _maybe_save_config(chat_id, text)
     await reply.send(chat_id, text, idempotency_key=msg.get("event_id"))
 
 
