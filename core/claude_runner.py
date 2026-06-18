@@ -14,6 +14,7 @@ core/claude_runner.py —— 调用本机 Claude Code（大脑）
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -40,9 +41,12 @@ _DISALLOWED = [
 ]
 
 
-def session_id_for(chat_id: str) -> str:
-    """同一飞书会话 → 同一确定性 UUID。"""
-    return str(uuid.uuid5(_NS, chat_id))
+def session_id_for(chat_id: str, system_prompt: str = "") -> str:
+    """同一飞书会话 + 同一人设 → 同一确定性 UUID。
+    把人设 hash 拌进去：人设/能力一改，session 就换 → Emmy 自动用新人设全新开始，
+    不会被旧 session 续聊焊住旧 system prompt（改完重启即生效，不用手删 session）。"""
+    h = hashlib.sha1((system_prompt or "").encode("utf-8")).hexdigest()[:12]
+    return str(uuid.uuid5(_NS, "%s:%s" % (chat_id, h)))
 
 
 def build_cmd(
@@ -123,7 +127,7 @@ async def run(
     重启后会丢 → 可能对已存在 session 误用 --session-id（报 "already in use"），
     或对不存在 session 误用 --resume。这里检测到不一致就自动切换模式重试一次。
     """
-    sid = session_id_for(chat_id)
+    sid = session_id_for(chat_id, system_prompt)
     res = await _invoke(prompt, sid, resume=resume,
                         system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout)
     stderr = res.get("raw_stderr") or ""
@@ -152,7 +156,10 @@ def _selftest() -> None:
     a, b, c = session_id_for("oc_x"), session_id_for("oc_x"), session_id_for("oc_y")
     assert a == b and a != c
     uuid.UUID(a)  # 是合法 UUID
-    print("✓ session_id 确定性派生")
+    # 人设变 → session 变（同 chat、不同人设派生不同 session）；同人设稳定
+    assert session_id_for("oc_x", "人设A") != session_id_for("oc_x", "人设B")
+    assert session_id_for("oc_x", "人设A") == session_id_for("oc_x", "人设A")
+    print("✓ session_id 确定性派生（绑 chat_id + 人设 hash）")
 
     # 2) build_cmd —— 新建会话
     cmd = build_cmd("帮我写周报", "sid1", resume=False, system_prompt="你是 Emmy")
