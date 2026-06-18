@@ -185,10 +185,7 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"))
         return
 
-    # 群聊：H1 两段式——要干活了先随机秒回一句（私聊不 ack，就像正常跟 CC 对话）
-    if not is_p2p:
-        await reply.send(chat_id, random.choice(ACK_REPLIES),
-                         idempotency_key=(msg.get("event_id") or "") + ":ack")
+    # 注：群聊的「队列播报」第一段由 ChatDispatcher.submit 在入队时已发（私聊不播报），这里直接干活。
 
     # 文件内容注入：仅【私聊】或【已配置群】才读；门禁未配置阶段不注入（免得大段文件污染配置收集）
     if file_ids and (is_p2p or cc is not None):
@@ -300,6 +297,15 @@ class Debouncer:
 MAX_CONCURRENT_CHATS = 4
 
 
+def _queue_ack(ahead: int, active: int) -> str:
+    """收到指令时先回的「队列播报」（替代原来的随机俏皮 ack）：排队/繁忙就报实情，闲就活泼。"""
+    if ahead > 0:
+        return random.choice(["好嘞~", "收到！", "在的~"]) + " 你前面还排着 %d 条，处理完立马到你 🐾" % ahead
+    if active >= MAX_CONCURRENT_CHATS:
+        return "收到啦~ 这会儿 %d 个群都在找我，排到你了，马上开工！🦊" % active
+    return random.choice(ACK_REPLIES)   # 闲：保持小 Emmy 活泼俏皮的劲儿
+
+
 class ChatDispatcher:
     """按 chat_id 分独立串行队列调度：
       - 同一个群【串行】（一条处理完再下一条）—— 保住该群 claude session 不被并发写坏；
@@ -314,14 +320,21 @@ class ChatDispatcher:
         self._sem = asyncio.Semaphore(max_concurrent)
         self._queues: dict = {}    # chat_id -> asyncio.Queue
         self._tasks: dict = {}     # chat_id -> asyncio.Task（每个群一个串行消费者）
+        self._active: set = set()  # 正在跑 handle 的 chat_id（算"几个群在忙"）
 
     async def submit(self, msg: dict) -> None:
         cid = msg["chat_id"]
         q = self._queues.get(cid)
+        ahead = q.qsize() if q is not None else 0   # 入队前，该群前面还等着几条
         if q is None:
             q = asyncio.Queue()
             self._queues[cid] = q
             self._tasks[cid] = asyncio.create_task(self._run_chat(cid, q))
+        # 群聊 + 有实质内容：刚收到就先「播报队列情况」（私聊/空消息不播报）
+        has_content = bool((msg.get("content") or "").strip()) or bool(msg.get("file_message_ids"))
+        if msg.get("chat_type") != "p2p" and has_content:
+            await reply.send(cid, _queue_ack(ahead, len(self._active)),
+                             idempotency_key=(msg.get("event_id") or "") + ":ack")
         await q.put(msg)
 
     async def _run_chat(self, cid: str, q: "asyncio.Queue") -> None:
@@ -329,7 +342,11 @@ class ChatDispatcher:
             msg = await q.get()
             try:
                 async with self._sem:   # 占一个全局并发名额（满了就在这等）
-                    await self._handle(msg, self._sp, self._sp_p2p)
+                    self._active.add(cid)
+                    try:
+                        await self._handle(msg, self._sp, self._sp_p2p)
+                    finally:
+                        self._active.discard(cid)
             except Exception as e:      # 单条失败不拖垮该群、更不拖垮别的群
                 print(f"[run] handle error ({cid}): {e}", flush=True)
             finally:
