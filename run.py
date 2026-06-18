@@ -152,18 +152,29 @@ _fix_workers: dict = {}   # chat_id -> asyncio.subprocess.Process（防重起）
 WORKER_LOG_DIR = os.path.expanduser("~/.emmy/logs")
 
 
+async def _reap_worker(chat_id: str, proc, logf) -> None:
+    """监督 worker：等它退出 → 关日志、从登记表删除（让该群能接新派工）、退出码异常则告警。
+    没有这个，proc.returncode 永远是 None，该群会被永久判定为「还在忙」、再也派不了工。"""
+    try:
+        rc = await proc.wait()
+    except Exception:  # noqa: BLE001
+        rc = -1
+    try:
+        logf.close()
+    except Exception:  # noqa: BLE001
+        pass
+    if _fix_workers.get(chat_id) and _fix_workers[chat_id][0] is proc:  # 只回收自己这次的
+        _fix_workers.pop(chat_id, None)
+    tag = "✓ 跑完" if rc in (0, None) else f"⚠️ 异常退出(rc={rc})"
+    print(f"[run] worker({chat_id}) {tag}", flush=True)
+
+
 async def _dispatch_fix_worker(chat_id: str) -> bool:
-    """收到派工信号 → 后台起 worker 修代码（该群已有 worker 在跑就不重起；worker 会扫所有待修复）。
-    worker 的输出写到 ~/.emmy/logs/worker-<chat>.log，方便 tail 观察它干了啥。"""
-    old = _fix_workers.get(chat_id)
-    if old is not None:
-        proc_old, logf_old = old
-        if proc_old.returncode is None:
-            return False                 # 还在跑，不重起
-        try:
-            logf_old.close()             # 上一轮结束了，关掉旧日志句柄（不泄漏 fd）
-        except Exception:                # noqa: BLE001
-            pass
+    """收到派工信号 → 后台起 worker（该群已有 worker 在跑就不重起）。退出由 _reap_worker 回收。
+    输出写到 ~/.emmy/logs/worker-<chat>.log，方便 tail 观察。"""
+    cur = _fix_workers.get(chat_id)
+    if cur is not None and cur[0].returncode is None:
+        return False                 # 还在跑，不重起
     os.makedirs(WORKER_LOG_DIR, exist_ok=True)
     log_path = os.path.join(WORKER_LOG_DIR, "worker-%s.log" % chat_id)
     logf = open(log_path, "a", buffering=1)  # 行缓冲，tail 能实时看到
@@ -171,6 +182,7 @@ async def _dispatch_fix_worker(chat_id: str) -> bool:
         sys.executable, os.path.join(PROJECT_DIR, "core", "worker.py"), chat_id,
         cwd=PROJECT_DIR, stdout=logf, stderr=logf)
     _fix_workers[chat_id] = (proc, logf)
+    asyncio.create_task(_reap_worker(chat_id, proc, logf))  # 监督回收，否则该群会卡死派不了工
     print(f"[run] 🛠️ 已为 {chat_id} 起代码侧 worker（pid={proc.pid}），日志: {log_path}", flush=True)
     return True
 

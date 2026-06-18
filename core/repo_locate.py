@@ -70,19 +70,31 @@ def locate(repo_path: Optional[str], expected_url: Optional[str] = None) -> Opti
 
 def make_worktree(repo_path: str, branch: str, worktree_dir: str, base: str = "dev") -> tuple:
     """在 repo 上开独立 worktree（不碰用户副本）。返回 (ok, msg)。
-    base：从哪个分支切（默认 dev，符合 git-workflow）。"""
+    base：从哪个分支切（默认 dev，符合 git-workflow）。
+    分支已存在（二次派工/重试同一 BUG）→ 复用挂载，不再用 -b 强制新建而失败。"""
     # 先确保 base 是最新的引用（不强制，失败不阻断）
     _git(["-C", repo_path, "fetch", "origin", base], timeout=60)
-    r = _git(["-C", repo_path, "worktree", "add", "-b", branch, worktree_dir, base])
-    if r.returncode != 0:
-        # base 不存在等情况，退回从当前 HEAD 切
-        r = _git(["-C", repo_path, "worktree", "add", "-b", branch, worktree_dir])
+    exists = _git(["-C", repo_path, "show-ref", "--verify", "--quiet",
+                   "refs/heads/%s" % branch]).returncode == 0
+    if exists:
+        # 已有同名 bugfix 分支：挂上去续改（保留之前的提交），不重建
+        r = _git(["-C", repo_path, "worktree", "add", worktree_dir, branch])
+    else:
+        r = _git(["-C", repo_path, "worktree", "add", "-b", branch, worktree_dir, base])
+        if r.returncode != 0:  # base 不存在等情况，退回从当前 HEAD 切
+            r = _git(["-C", repo_path, "worktree", "add", "-b", branch, worktree_dir])
     return (r.returncode == 0, (r.stderr or r.stdout).strip())
 
 
 def remove_worktree(repo_path: str, worktree_dir: str) -> None:
     """清理 worktree（保留分支，便于 PR）。"""
     _git(["-C", repo_path, "worktree", "remove", "--force", worktree_dir])
+
+
+def branch_on_remote(repo_path: str, branch: str) -> bool:
+    """分支是否已推到 origin（worker 据此确认 claude 真的 push 了，而不是嘴上说 done）。"""
+    r = _git(["-C", repo_path, "ls-remote", "--heads", "origin", branch], timeout=30)
+    return r.returncode == 0 and bool(r.stdout.strip())
 
 
 # ---------------- 自测（python3 core/repo_locate.py）----------------
@@ -122,9 +134,13 @@ def _selftest() -> None:
     # 主副本 dirty 不出现在 worktree（worktree 应干净）
     st = _git(["-C", wt, "status", "--porcelain"]).stdout
     assert st.strip() == "", "新 worktree 应干净, 实际: " + st
+    remove_worktree(here, wt)  # 删工作目录、保留分支
+    # 二次派工：分支已存在 → 复用挂载应成功（修复「二次派工必 worktree-fail」）
+    ok2, msg2 = make_worktree(here, "emmy_wt_selftest_br", wt, base="dev")
+    assert ok2, "分支已存在时复用失败: " + msg2
     remove_worktree(here, wt)
     _git(["-C", here, "branch", "-D", "emmy_wt_selftest_br"])
-    print("✓ git worktree 开/清 + 隔离（新工作目录干净）")
+    print("✓ git worktree 开/清 + 隔离 + 分支已存在复用")
 
     print("\nrepo_locate 自测全部通过 ✅")
 
