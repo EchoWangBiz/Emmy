@@ -1,0 +1,17 @@
+# Emmy 配置模板 —— 复制为 emmy.yaml 后按实际填写（emmy.yaml 不入库）
+#
+# 每个群的「角色 + 资源绑定」：Emmy 收到消息后据此知道
+#   "这是什么群、BUG 表在哪、对应代码仓库在哪"，不用每次让你给链接。
+
+chats:
+  # 示例：把 oc_xxx 换成真实 chat_id（Emmy 日志/事件里能看到）
+  oc_73427356f7c497faf73aaf062e3149df:
+    name: MASS业务平台-内测群          # 仅备注，方便你看
+    role: fix-bug                     # 能力角色：fix-bug（后续可加 daily-report 等）
+    base_app_token: bascn_xxxxxxxxxx  # BUG 多维表格的 app-token（base-token）
+    base_table_id:  tblxxxxxxxxxx     # 表 id
+    repo: /Users/echo/project/mass    # 本地已 clone 的项目【绝对路径】（给 worker，避免重复 clone）
+
+# 全局默认（可选）
+defaults:
+  model: claude-sonnet-4-6
