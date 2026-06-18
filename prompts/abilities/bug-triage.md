@@ -47,12 +47,12 @@
 
 1. **读现有表字段**：
    ```
-   lark-cli base +field-list --base-token <t> --table-id <tbl> --format json
+   emmy-lark base +field-list --base-token <t> --table-id <tbl> --format json
    ```
 2. **和上面模板逐字段比对**（先查存在再决定，**别重复建**——保证多次进群幂等）。
 3. **缺的业务字段自动补**（纯新增、低危）：
    ```
-   lark-cli base +field-create --base-token <t> --table-id <tbl> --json '{"name":"待确认问题","type":"text"}'
+   emmy-lark base +field-create --base-token <t> --table-id <tbl> --json '{"name":"待确认问题","type":"text"}'
    # 状态字段用 select：--json '{"name":"状态","type":"select","options":[{"name":"待处理"},{"name":"待修复"},...]}'
    ```
    ⚠️ 若 `field-create` 报权限错（bot 无 schema 写权限）→ **别硬试**，列出缺的字段让群主手动建。
@@ -63,21 +63,21 @@
 
 ---
 
-## 各操作的 lark-cli 命令（已实测 flag，照这个用）
+## 各操作的 emmy-lark 命令（已实测 flag，照这个用）
 
 ```bash
 # 读 BUG 记录
-lark-cli base +record-list --base-token <t> --table-id <tbl>
+emmy-lark base +record-list --base-token <t> --table-id <tbl>
 
 # 改状态（注意：patch 会应用到 record_id_list 里的所有记录！）
-lark-cli base +record-batch-update --base-token <t> --table-id <tbl> \
+emmy-lark base +record-batch-update --base-token <t> --table-id <tbl> \
   --json '{"record_id_list":["rec_xxx"],"patch":{"状态":"待修复"}}'
 
 # 拿群成员（@ 用）
-lark-cli im chat.members get --chat-id <群id>
+emmy-lark im chat.members get --chat-id <群id>
 
 # @ 提问人通知
-lark-cli im +messages-send --as bot --chat-id <群id> --msg-type text \
+emmy-lark im +messages-send --as bot --chat-id <群id> --msg-type text \
   --content '{"text":"<at user_id=\"ou_xxx\"></at> 你提的 #0009 修好了，PR: <链接>，麻烦验收~"}'
 ```
 > @人：先 `chat.members get` 拿 open_id，把提问人名字对上群成员；**对不上 / 重名 → 纯文本写名字，绝不 @ 错人**。
