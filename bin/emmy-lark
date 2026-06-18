@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""
+bin/emmy-lark —— Emmy 的飞书命令安全门禁（包装 lark-cli）
+
+Emmy 大脑只被授权调用本命令（claude_runner 的 allowedTools=Bash(emmy-lark:*)，
+直连 lark-cli 被 disallow）。本包装：高危操作硬拦，其余透传给真正的 lark-cli。
+判定逻辑在 core/lark_gate.py（可单测）。
+"""
+import json
+import os
+import sys
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+from core.lark_gate import classify  # noqa: E402
+
+blocked, reason = classify(sys.argv[1:])
+if blocked:
+    sys.stderr.write(json.dumps({
+        "error": "BLOCKED_BY_EMMY_GATE",
+        "reason": reason,
+        "message": f"这个高危操作（{reason}）被安全门禁拦下了——这类不可逆/大范围操作"
+                   f"我不能自动执行，需要人工在终端亲自来。请如实把这条告诉对方。",
+    }, ensure_ascii=False) + "\n")
+    sys.exit(13)
+
+# 放行：透传给真正的 lark-cli（execvp 走 PATH 找 lark-cli，不会回到本包装）
+try:
+    os.execvp("lark-cli", ["lark-cli"] + sys.argv[1:])
+except FileNotFoundError:
+    sys.stderr.write("emmy-lark: 找不到 lark-cli，请确认已安装 @larksuite/cli\n")
+    sys.exit(127)

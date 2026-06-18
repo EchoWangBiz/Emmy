@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from typing import List, Optional
 
@@ -23,8 +24,20 @@ PIPE = asyncio.subprocess.PIPE
 # 固定命名空间：把 feishu chat_id 派生成稳定的 session UUID（跨重启续聊）
 _NS = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
 
-# 默认挡掉的高危命令（第一版的安全护栏；H3 后续会换成受控包装层）
-_DISALLOWED = ["Bash(rm:*)", "Bash(sudo:*)", "Bash(curl:*)", "Bash(ssh:*)", "Bash(git:*)"]
+# 安全护栏：Emmy 只能走包装命令 emmy-lark（高危飞书操作由 core/lark_gate 硬拦）。
+# ⚠️ claude 的 allowed/disallowed 只匹配【顶层 Bash 命令字符串】、非 OS 级强制——
+#    解释器(python/node/sh)起子进程、或用绝对路径，理论上能绕过。这里 deny 常见逃逸路径
+#    把门槛抬高（deny 优先级最高），真正的强隔离需 OS sandbox（见 emmy-dangerous-cmd-gate 备忘）。
+_DISALLOWED = [
+    "Bash(rm:*)", "Bash(sudo:*)", "Bash(curl:*)", "Bash(ssh:*)", "Bash(git:*)",
+    "Bash(lark-cli:*)",                                          # 直连真 lark-cli（绕过包装）
+    # 解释器 / shell —— 防起子进程绕过 emmy-lark 调飞书
+    "Bash(python:*)", "Bash(python3:*)", "Bash(node:*)", "Bash(deno:*)", "Bash(bun:*)",
+    "Bash(ruby:*)", "Bash(perl:*)", "Bash(php:*)",
+    "Bash(sh:*)", "Bash(bash:*)", "Bash(zsh:*)", "Bash(fish:*)",
+    "Bash(env:*)", "Bash(eval:*)", "Bash(exec:*)", "Bash(xargs:*)", "Bash(nohup:*)",
+    "Bash(/*)",                                                  # 绝对路径直调（如 /opt/.../lark-cli）
+]
 
 
 def session_id_for(chat_id: str) -> str:
@@ -39,14 +52,14 @@ def build_cmd(
     resume: bool,
     system_prompt: str = "",
     model: str = "claude-sonnet-4-6",
-    allowed_tools: str = "Bash(lark-cli:*)",
+    allowed_tools: str = "Bash(emmy-lark:*)",
 ) -> List[str]:
     """构造 claude -p 命令（纯函数，便于单测）。"""
     cmd = ["claude", "-p", prompt, "--output-format", "json"]
     cmd += (["--resume", session_id] if resume else ["--session-id", session_id])
     if system_prompt:
         cmd += ["--append-system-prompt", system_prompt]
-    cmd += ["--permission-mode", "dontAsk", "--allowedTools", allowed_tools]
+    cmd += ["--permission-mode", "default", "--allowedTools", allowed_tools]
     cmd += ["--disallowedTools", *_DISALLOWED]
     cmd += ["--model", model, "--strict-mcp-config"]
     return cmd
@@ -75,7 +88,11 @@ async def _invoke(
 ) -> dict:
     """实际跑一次 claude；总是带回 raw_stderr（自愈判断 + 诊断都要用）。"""
     cmd = build_cmd(prompt, sid, resume=resume, system_prompt=system_prompt)
-    proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=env, stdout=PIPE, stderr=PIPE)
+    # 把项目 bin/ 注入 PATH，让 claude 的 Bash 能找到包装命令 emmy-lark（原 PATH 保留，claude/lark-cli 仍可寻）
+    proc_env = dict(env or os.environ)
+    if cwd:
+        proc_env["PATH"] = os.path.join(cwd, "bin") + os.pathsep + proc_env.get("PATH", "")
+    proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=proc_env, stdout=PIPE, stderr=PIPE)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -141,10 +158,11 @@ def _selftest() -> None:
     cmd = build_cmd("帮我写周报", "sid1", resume=False, system_prompt="你是 Emmy")
     assert cmd[:4] == ["claude", "-p", "帮我写周报", "--output-format"]
     assert "--session-id" in cmd and "sid1" in cmd and "--resume" not in cmd
-    assert "dontAsk" in cmd and "Bash(lark-cli:*)" in cmd
+    assert "default" in cmd and "Bash(emmy-lark:*)" in cmd   # 合法 permission-mode + 只允许包装命令
     assert "你是 Emmy" in cmd
-    assert "Bash(rm:*)" in cmd  # 高危命令被挡
-    print("✓ build_cmd 新建会话 + 权限护栏")
+    # 高危 / 直连 lark-cli / 解释器 / 绝对路径 都进 deny
+    assert all(x in cmd for x in ("Bash(rm:*)", "Bash(lark-cli:*)", "Bash(python3:*)", "Bash(sh:*)", "Bash(/*)"))
+    print("✓ build_cmd 新建会话 + 权限护栏（emmy-lark 包装 + 解释器/绝对路径逃逸 deny）")
 
     # 3) build_cmd —— 续聊
     cmd2 = build_cmd("继续", "sid1", resume=True)
