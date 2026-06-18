@@ -3,10 +3,10 @@
 run.py —— Emmy 主进程
 
 主链路：
-  lark-cli event consume (listener) → asyncio.Queue (单消费者串行)
-    → claude_runner.run (大脑用 lark-cli 干活) → reply.send (发回原会话)
+  lark-cli event consume (listener) → 防抖聚合 → ChatDispatcher (按群分发)
+    → claude_runner.run (大脑干活) → reply.send (发回原会话)
 
-第一版：单消费者串行（单人单机并发极低，串行天然防同 session 并发写 jsonl）。
+并发模型：同一个群【串行】（保 session 不被并发写坏），不同群【并行】，全局 Semaphore 限并发上限。
 
 ⚠️ 端到端跑通需要两个前提：
   ① 本机 claude 已登录（claude / claude setup-token）—— 否则 claude_runner 报未登录
@@ -296,25 +296,53 @@ class Debouncer:
             print(f"[debouncer] flush 失败，丢弃 {len(msgs)} 条: {e}", flush=True)
 
 
-async def worker(queue: "asyncio.Queue", system_prompt: str, system_prompt_p2p: str) -> None:
-    while True:
-        msg = await queue.get()
-        try:
-            await handle(msg, system_prompt, system_prompt_p2p)
-        except Exception as e:  # 单条失败不拖垮主进程
-            print(f"[run] handle error: {e}", flush=True)
-        finally:
-            queue.task_done()
+# 全局并发上限：同时最多几个群在跑 claude（单机资源有限，别让活跃群太多把机器拖垮）
+MAX_CONCURRENT_CHATS = 4
+
+
+class ChatDispatcher:
+    """按 chat_id 分独立串行队列调度：
+      - 同一个群【串行】（一条处理完再下一条）—— 保住该群 claude session 不被并发写坏；
+      - 不同群【并行】—— 群 A 不再阻塞群 B；
+      - 全局 Semaphore 限并发 —— 同时在跑的群数有上限，超出的排队等。"""
+
+    def __init__(self, handle_fn, system_prompt: str, system_prompt_p2p: str,
+                 max_concurrent: int = MAX_CONCURRENT_CHATS) -> None:
+        self._handle = handle_fn
+        self._sp = system_prompt
+        self._sp_p2p = system_prompt_p2p
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._queues: dict = {}    # chat_id -> asyncio.Queue
+        self._tasks: dict = {}     # chat_id -> asyncio.Task（每个群一个串行消费者）
+
+    async def submit(self, msg: dict) -> None:
+        cid = msg["chat_id"]
+        q = self._queues.get(cid)
+        if q is None:
+            q = asyncio.Queue()
+            self._queues[cid] = q
+            self._tasks[cid] = asyncio.create_task(self._run_chat(cid, q))
+        await q.put(msg)
+
+    async def _run_chat(self, cid: str, q: "asyncio.Queue") -> None:
+        while True:
+            msg = await q.get()
+            try:
+                async with self._sem:   # 占一个全局并发名额（满了就在这等）
+                    await self._handle(msg, self._sp, self._sp_p2p)
+            except Exception as e:      # 单条失败不拖垮该群、更不拖垮别的群
+                print(f"[run] handle error ({cid}): {e}", flush=True)
+            finally:
+                q.task_done()
 
 
 async def main() -> None:
     system_prompt = load_system_prompt()                            # 群聊：人设 + 全部能力
     system_prompt_p2p = load_system_prompt(include_abilities=False)  # 私聊：仅人设，纯 CC 对话
-    queue: "asyncio.Queue" = asyncio.Queue()
-    asyncio.create_task(worker(queue, system_prompt, system_prompt_p2p))  # 单消费者
 
-    # 监听 → 防抖聚合 → 入队（连发的多条先并成一条，再交给单消费者）
-    debouncer = Debouncer(AGGREGATE_DELAY, queue.put)
+    # 监听 → 防抖聚合 → 按群分发（同群串行、跨群并行、全局限并发）
+    dispatcher = ChatDispatcher(handle, system_prompt, system_prompt_p2p)
+    debouncer = Debouncer(AGGREGATE_DELAY, dispatcher.submit)
 
     async def on_message(msg: dict) -> None:
         debouncer.feed(msg)
