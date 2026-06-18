@@ -23,7 +23,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from core import listener, claude_runner, reply, config  # noqa: E402
+from core import listener, claude_runner, reply, config, attachments  # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_FILE = os.path.join(PROJECT_DIR, "prompts", "emmy_system.md")
@@ -41,6 +41,12 @@ ACK_REPLIES = [
     "包在我身上！",
     "在的在的~",
 ]
+
+# 收到既没文字又没可读文件时的温和兜底（图片/贴纸/读不了的文件，别静默）
+EMPTY_TIP = "我现在只看得懂文字和文本类文件哦~ 图片之类的先用文字跟我说说要干嘛呀 🦊"
+
+# 可能携带可下载文件资源的消息类型（飞书「文字+拖文件」常是 post 富文本，不只 file）
+_RESOURCE_TYPES = ("file", "post", "media")
 
 # 记录哪些 chat 已开过 session（用于 --resume 续聊）
 _seen_chats: set = set()
@@ -150,17 +156,36 @@ def _diagnose(res: dict) -> str:
 async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     chat_id = msg["chat_id"]
     content = (msg.get("content") or "").strip()
-    if not content:
-        # 一窗口全是图片/文件/贴纸这类非文本（飞书预渲染 content 为空）→ 别静默，温和提示一句
-        await reply.send(chat_id, "我现在只看得懂文字哦~ 图片/文件先用文字跟我说说要干嘛呀 🦊",
-                         idempotency_key=msg.get("event_id"))
+    file_ids = msg.get("file_message_ids") or []
+    is_p2p = msg.get("chat_type") == "p2p"
+    cc = None if is_p2p else config.chat_config(chat_id)
+
+    # 纯空消息（既没文字又没文件）→ 温和提示，不 ack、不调 claude
+    if not content and not file_ids:
+        await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"))
         return
+
+    # 群聊：H1 两段式——要干活了先随机秒回一句（私聊不 ack，就像正常跟 CC 对话）
+    if not is_p2p:
+        await reply.send(chat_id, random.choice(ACK_REPLIES),
+                         idempotency_key=(msg.get("event_id") or "") + ":ack")
+
+    # 文件内容注入：仅【私聊】或【已配置群】才读；门禁未配置阶段不注入（免得大段文件污染配置收集）
+    if file_ids and (is_p2p or cc is not None):
+        file_text = await attachments.gather(file_ids)
+        if file_text:
+            content = (content + "\n\n" + file_text).strip()
+
+    # 读完文件仍没有任何可用内容（图片/读不了的文件且无文字）→ 温和提示
+    if not content:
+        await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"))
+        return
+
     resume = chat_id in _seen_chats
     _seen_chats.add(chat_id)
 
-    # 私聊（p2p）：正常跟 Claude Code 对话——精简 system prompt（不带群里的 BUG 能力）+ 私聊定位，
-    # 不门禁、不注入群配置、不秒回 ack，问啥答啥
-    if msg.get("chat_type") == "p2p":
+    # 私聊（p2p）：正常跟 Claude Code 对话——精简 system prompt（不带群里的 BUG 能力）+ 私聊定位
+    if is_p2p:
         res = await claude_runner.run(
             P2P_PREFIX + content, chat_id, resume=resume,
             system_prompt=system_prompt_p2p, cwd=PROJECT_DIR)
@@ -168,14 +193,8 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         await reply.send(chat_id, text, idempotency_key=msg.get("event_id"))
         return
 
-    # 群聊：H1 两段式——先随机秒回一句（避免以为机器人挂了，也更有 Emmy 的活泼劲儿）
-    await reply.send(chat_id, random.choice(ACK_REPLIES),
-                     idempotency_key=(msg.get("event_id") or "") + ":ack")
-
-    # 配置门禁：群没配过 → 走引导收集；配好了 → 注入群上下文正常干活
-    cc = config.chat_config(chat_id)
+    # 群聊：配置门禁（没配过 → 引导收集；配好了 → 注入群上下文正常干活）
     prompt = _with_chat_context(chat_id, content) if cc else _onboard_prompt(chat_id, content)
-
     res = await claude_runner.run(
         prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
     if res["is_error"]:
@@ -195,11 +214,15 @@ AGGREGATE_MAX_WAIT = 8.0    # 秒：硬上限——从该批首条算起最多�
 
 
 def _merge_msgs(msgs: list) -> dict:
-    """同一 chat 的多条消息合并成一条：内容按行拼接，回复挂最后一条，幂等键用第一条。"""
+    """同一 chat 的多条消息合并成一条：内容按行拼接，回复挂最后一条，幂等键用第一条。
+    同时收集文件类消息的 message_id —— 框架据此下载并读出文本内容注入给 Emmy。"""
     base = dict(msgs[-1])
     base["content"] = "\n".join(
         c for c in ((m.get("content") or "").strip() for m in msgs) if c)
     base["event_id"] = msgs[0].get("event_id", "")
+    base["file_message_ids"] = [
+        m["message_id"] for m in msgs
+        if m.get("message_type") in _RESOURCE_TYPES and m.get("message_id")]
     return base
 
 

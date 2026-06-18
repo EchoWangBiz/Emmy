@@ -17,6 +17,8 @@ logs/
 *.plist
 .emmy/
 .emmy-worktrees/
+# lark-cli --download-resources 的落地目录（现已改用系统临时目录+用后即删，此条为防御性兜底）
+lark-im-resources/
 data/
 
 # ── Python ──────────────────────────────────────────────
