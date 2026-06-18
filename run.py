@@ -179,8 +179,8 @@ async def _dispatch_fix_worker(chat_id: str) -> bool:
     log_path = os.path.join(WORKER_LOG_DIR, "worker-%s.log" % chat_id)
     logf = open(log_path, "a", buffering=1)  # 行缓冲，tail 能实时看到
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, os.path.join(PROJECT_DIR, "core", "worker.py"), chat_id,
-        cwd=PROJECT_DIR, stdout=logf, stderr=logf)
+        sys.executable, "-u", os.path.join(PROJECT_DIR, "core", "worker.py"), chat_id,
+        cwd=PROJECT_DIR, stdout=logf, stderr=logf)  # -u：worker 无缓冲，日志实时滚（tail 看得到进度）
     _fix_workers[chat_id] = (proc, logf)
     asyncio.create_task(_reap_worker(chat_id, proc, logf))  # 监督回收，否则该群会卡死派不了工
     print(f"[run] 🛠️ 已为 {chat_id} 起代码侧 worker（pid={proc.pid}），日志: {log_path}", flush=True)
