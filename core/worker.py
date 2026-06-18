@@ -112,10 +112,54 @@ async def write_back(base_token: str, table_id: str, record_id: str, patch: dict
     await _lark_json(build_update_cmd(base_token, table_id, [record_id], patch))
 
 
+# ---------------- 修完回群通知 + @提问人 ----------------
+def _at_markup(members_items: list, name: str) -> str:
+    """把提问人名字对到群成员 open_id 的 <at> 标记；对不上 / 重名 → 纯文本名（绝不 @ 错人）。"""
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    hits = [m for m in (members_items or []) if str(m.get("name", "")).strip() == name]
+    if len(hits) == 1:
+        oid = hits[0].get("open_id") or hits[0].get("member_id")
+        if oid:
+            return '<at user_id="%s"></at>' % oid
+    return name
+
+
+def _result_message(at: str, num: str, r: dict) -> str:
+    """按修复结果拼一句群通知（@提问人在前）。"""
+    who = (at + " ") if at else ""
+    outcome = r.get("result")
+    if outcome == "done":
+        return "%s你提的 #%s 修好啦~ PR：%s，麻烦验收下哈 🛠️" % (who, num, r.get("pr") or "(见表格)")
+    if outcome == "blocked":
+        return "%s#%s 我修的时候有个拿不准的地方：%s 帮我确认下哈~" % (who, num, r.get("q") or "见表格「待确认问题」")
+    if outcome in ("locate-fail", "worktree-fail"):
+        return "#%s 我这边准备改代码的环境出了点问题，先没修成，回头看下哈~" % num
+    return "#%s 我处理了一下但没完全搞定，麻烦人工看一眼~" % num
+
+
+async def _send_group(chat_id: str, text: str) -> None:
+    await _lark_json(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
+                      "--msg-type", "text",
+                      "--content", json.dumps({"text": text}, ensure_ascii=False)])
+
+
+async def notify_results(chat_id: str, results: list) -> None:
+    """results: [(rec, fix_result)]。逐条发群通知 + @提问人。"""
+    members = await _lark_json(["im", "chat.members", "get", "--chat-id", chat_id, "--format", "json"])
+    items = (((members or {}).get("data") or {}).get("items")) or (members or {}).get("items") or []
+    for rec, r in results:
+        f = rec.get("fields") or {}
+        num = _field(f)["编号"]
+        asker = f.get("提问人") or f.get("报告人") or f.get("反馈人") or ""
+        await _send_group(chat_id, _result_message(_at_markup(items, asker), num, r))
+
+
 # ---------------- worker claude 调用 ----------------
 async def _run_claude(prompt: str, cwd: str, timeout: int = 900) -> dict:
     cmd = ["claude", "-p", prompt, "--output-format", "json",
-           "--permission-mode", "dontAsk",
+           "--permission-mode", "default",
            "--allowedTools", WORKER_ALLOWED,
            "--disallowedTools", *WORKER_DISALLOWED,
            "--model", "claude-sonnet-4-6", "--strict-mcp-config"]
@@ -196,11 +240,14 @@ async def run_worker(chat_id: str) -> list:
         return []
     pend = await read_pending(base_token, table_id)
     print("待修复 %d 条" % len(pend))
-    results = []
+    paired = []
     for rec in pend:  # 串行：一条条修，稳
-        results.append(await fix_one(rec, repo, base_token, table_id))
-        print("  ->", results[-1])
-    return results
+        r = await fix_one(rec, repo, base_token, table_id)
+        paired.append((rec, r))
+        print("  ->", r)
+    if paired:
+        await notify_results(chat_id, paired)  # 修完回群通知 + @提问人（闭环最后一步）
+    return [r for _, r in paired]
 
 
 async def check_ready(chat_id: str) -> None:
@@ -290,6 +337,21 @@ def _selftest() -> None:
     assert "Bash(git:*)" in WORKER_ALLOWED and "Bash(gh:*)" in WORKER_ALLOWED
     assert "Bash(rm:*)" in WORKER_DISALLOWED and "Bash(sudo:*)" in WORKER_DISALLOWED
     print("✓ worker allowedTools 放开 git/gh、挡 rm/sudo")
+
+    # 6) @提问人：单一匹配→open_id，重名/对不上→纯文本（绝不 @ 错人）
+    members = [{"name": "张三", "open_id": "ou_a"}, {"name": "李四", "open_id": "ou_b"}]
+    assert _at_markup(members, "张三") == '<at user_id="ou_a"></at>'
+    assert _at_markup(members, "王五") == "王五"
+    assert _at_markup([{"name": "张三", "open_id": "o1"}, {"name": "张三", "open_id": "o2"}], "张三") == "张三"
+    assert _at_markup(members, "") == ""
+    print("✓ _at_markup：单一匹配 @、重名/对不上用文本名")
+
+    # 7) 完成通知文案：done/blocked/fail
+    assert "修好啦" in _result_message('<at user_id="o"></at>', "0006", {"result": "done", "pr": "http://pr/1"})
+    assert "http://pr/1" in _result_message("", "0006", {"result": "done", "pr": "http://pr/1"})
+    assert "拿不准" in _result_message("", "0007", {"result": "blocked", "q": "选哪个改法"})
+    assert "环境出了点问题" in _result_message("", "0008", {"result": "locate-fail"})
+    print("✓ _result_message：done/blocked/fail 文案")
 
     print("\nworker 纯逻辑自测全部通过 ✅（端到端真改代码需 emmy.yaml 配好 MASS repo 后一起测）")
 
