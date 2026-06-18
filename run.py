@@ -29,17 +29,16 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_FILE = os.path.join(PROJECT_DIR, "prompts", "emmy_system.md")
 ABILITIES_DIR = os.path.join(PROJECT_DIR, "prompts", "abilities")
 
-# 收到消息先秒回一句（H1 两段式）——随机挑一句，更像活泼爱俏皮的小 Emmy
+# 收到消息先秒回一句（H1 两段式的第一段）——明确「收到 + 在处理 + 稍等」，让用户知道后面还有正式回复，
+# 而不是"在的在的"这种闲聊式让人以为没下文了。
 ACK_REPLIES = [
-    "好嘞！🦊",
-    "好的呀~",
-    "Okkk~",
-    "收到收到！",
-    "嗯嗯，这就来~",
-    "马上办！✨",
-    "好哒~ 🐾",
-    "包在我身上！",
-    "在的在的~",
+    "收到~ 我看看哈，稍等一下下 🦊",
+    "好嘞！这就去办，马上回你~",
+    "收到啦！让我瞧瞧，稍等~ 🐾",
+    "好的呀~ 我去处理了，一会儿回你",
+    "嗯嗯收到，这就来处理，稍等哈 ✨",
+    "好哒~ 让我看看，马上回你 🐾",
+    "包在我身上！处理中，稍等一下~",
 ]
 
 # 收到既没文字又没可读文件时的温和兜底（图片/贴纸/读不了的文件，别静默）
@@ -349,6 +348,11 @@ class ChatDispatcher:
                         self._active.discard(cid)
             except Exception as e:      # 单条失败不拖垮该群、更不拖垮别的群
                 print(f"[run] handle error ({cid}): {e}", flush=True)
+                try:  # 别让用户「没后续」——出错也回一句，至少有反馈
+                    await reply.send(cid, "哎呀我这边卡了一下下，稍后再喊我一次试试？🙏",
+                                     idempotency_key=(msg.get("event_id") or "") + ":err")
+                except Exception:
+                    pass
             finally:
                 q.task_done()
 
