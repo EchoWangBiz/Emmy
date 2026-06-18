@@ -94,10 +94,34 @@ def build_update_cmd(base_token: str, table_id: str, record_ids: list, patch: di
     return ["base", "+record-batch-update", "--base-token", base_token, "--table-id", table_id, "--json", payload]
 
 
+def _flatten(val):
+    """把 lark-cli 单元格值规整成简单字符串：['待处理']→'待处理'，[{'text':..}]→文本，None→''。"""
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        return ",".join(p for p in (_flatten(v) for v in val) if p)
+    if isinstance(val, dict):
+        return str(val.get("text") or val.get("name") or val.get("value") or "")
+    return str(val)
+
+
 def pending_records(listing: dict) -> list:
-    """从 record-list 返回里挑出 状态=待修复 的记录（纯函数，便于单测）。"""
-    items = (((listing or {}).get("data") or {}).get("items")) or (listing or {}).get("items") or []
+    """从 record-list 返回里挑出 状态=待修复 的记录（纯函数，便于单测）。
+    兼容 lark-cli 的【表格式】（data.fields 列名 + data.data 二维值 + data.record_id_list）
+    与飞书原生【items】两种返回结构。"""
+    data = (listing or {}).get("data") or {}
     out = []
+    if isinstance(data.get("data"), list) and data.get("fields"):
+        # 表格式：每行是一个值数组，按 fields 列名对位
+        fields = data["fields"]
+        rids = data.get("record_id_list") or []
+        for row, rid in zip(data["data"], rids):
+            rf = {name: _flatten(v) for name, v in zip(fields, row)}
+            if str(rf.get(STATUS_FIELD, "")).strip() == "待修复":
+                out.append({"record_id": rid, "fields": rf})
+        return out
+    # items 格式（兼容）
+    items = data.get("items") or (listing or {}).get("items") or []
     for it in items:
         fields = it.get("fields") or {}
         if str(fields.get(STATUS_FIELD, "")).strip() == "待修复":
@@ -179,8 +203,10 @@ def _field(bug_fields: dict) -> dict:
     f = bug_fields
     return {
         "编号": f.get("问题编号") or f.get("编号") or "?",
-        "摘要": f.get("问题摘要") or f.get("摘要") or "",
-        "详情": " | ".join(str(f.get(k, "")) for k in ("复现步骤", "期望", "实际", "复现/期望/实际") if f.get(k)),
+        "摘要": f.get("问题摘要") or f.get("摘要") or f.get("问题内容") or "",
+        "详情": " | ".join(str(f.get(k, "")) for k in
+                          ("复现步骤", "期望", "实际", "复现/期望/实际", "问题内容", "问题类型", "所属模块")
+                          if f.get(k)),
     }
 
 
@@ -333,7 +359,26 @@ def _selftest() -> None:
     ]}}
     pend = pending_records(listing)
     assert [r["record_id"] for r in pend] == ["r1", "r3"], pend
-    print("✓ pending_records 只挑 待修复")
+    print("✓ pending_records 只挑 待修复（items 格式）")
+
+    # 表格式（lark-cli 真实返回）：fields 列名 + data 二维 + record_id_list，状态是 ['待修复'] 数组
+    grid = {"data": {
+        "fields": ["问题编号", "问题内容", "提问人", "状态"],
+        "data": [
+            ["0006", "改LOGO", "王文胜", ["待处理"]],
+            ["0007", "国际化", "齐凯", ["待修复"]],
+            ["0008", "别的", "李四", ["已验收"]],
+        ],
+        "record_id_list": ["rec6", "rec7", "rec8"],
+    }}
+    pg = pending_records(grid)
+    assert [r["record_id"] for r in pg] == ["rec7"], pg
+    assert pg[0]["fields"]["问题内容"] == "国际化" and pg[0]["fields"]["提问人"] == "齐凯"
+    print("✓ pending_records 表格式（lark-cli 真实结构）+ 值规整")
+
+    assert _flatten(["待处理"]) == "待处理" and _flatten(None) == "" and _flatten("x") == "x"
+    assert _flatten([{"text": "a"}, {"text": "b"}]) == "a,b"
+    print("✓ _flatten 规整单元格值")
 
     # 5) worker 权限：放开 git、仍挡 rm/sudo
     assert "Bash(git:*)" in WORKER_ALLOWED and "Bash(gh:*)" in WORKER_ALLOWED
