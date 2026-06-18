@@ -168,16 +168,17 @@ def _at_markup(members_items: list, name: str) -> str:
 
 
 def _result_message(at: str, num: str, r: dict) -> str:
-    """按修复结果拼一句群通知（@提问人在前）。"""
+    """按修复结果拼一句群通知（@提问人在前；失败也 @ 并带可操作真因，别只埋表格）。"""
     who = (at + " ") if at else ""
     outcome = r.get("result")
     if outcome == "done":
-        return "%s你提的 #%s 修好啦~ PR：%s，麻烦验收下哈 🛠️" % (who, num, r.get("pr") or "(见表格)")
+        msg = "%s你提的 #%s 修好啦~ PR：%s，麻烦验收下哈 🛠️" % (who, num, r.get("pr") or "(见表格)")
+        if r.get("wrote") is False:   # 代码/PR 都好了，只是表格状态没写进去
+            msg += "\n（表格状态我没写进去，群主帮把 #%s 点成「待发布」就行~）" % num
+        return msg
     if outcome == "blocked":
         return "%s#%s 我修的时候有个拿不准的地方：%s 帮我确认下哈~" % (who, num, r.get("q") or "见表格「待确认问题」")
-    if outcome in ("locate-fail", "worktree-fail"):
-        return "#%s 我这边准备改代码的环境出了点问题，先没修成，回头看下哈~" % num
-    return "#%s 我处理了一下但没完全搞定，麻烦人工看一眼~" % num
+    return "%s#%s 这次没跑成 —— %s" % (who, num, r.get("reason") or "我看下日志再来")
 
 
 async def _send_group(chat_id: str, text: str) -> bool:
@@ -226,6 +227,18 @@ def _field(bug_fields: dict) -> dict:
     }
 
 
+# ---------------- MR/PR 链接（框架确定性构造，不靠 claude 编）----------------
+def _mr_url(repo_url: str, branch: str, base: str = "dev") -> str:
+    """构造 MR/PR 创建链接。claude 从 push 输出抠链接不可靠（分支已存在时抠不到会瞎编成
+    登录页之类），所以由 worker 用 repo URL + 分支名确定性拼。repo_url 是规范化 https://host/group/proj。"""
+    from urllib.parse import quote
+    b, t = quote(branch, safe=""), quote(base, safe="")
+    if "gitlab" in repo_url:
+        return ("%s/-/merge_requests/new?merge_request%%5Bsource_branch%%5D=%s"
+                "&merge_request%%5Btarget_branch%%5D=%s" % (repo_url, b, t))
+    return "%s/compare/%s...%s?expand=1" % (repo_url, t, b)   # GitHub
+
+
 # ---------------- 单条修复 ----------------
 async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> dict:
     bug = _field(rec.get("fields") or {})
@@ -235,8 +248,9 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
     if not loc:
         await write_back(base_token, table_id, rid,
                          {STATUS_FIELD: "待人工确认",
-                          "AI备注": "项目定位失败：%s 不是有效 git 仓库，请确认 emmy.yaml 的 repo 路径" % repo_path})
-        return {"id": bug["编号"], "result": "locate-fail"}
+                          "AI备注": "项目定位失败：%s 不是有效 git 仓库" % repo_path})
+        return {"id": bug["编号"], "result": "locate-fail",
+                "reason": "代码路径好像不对，群主帮我核下 emmy.yaml 的 repo 哈"}
 
     top = loc["toplevel"]
     branch = "bugfix/%s" % bug["编号"]
@@ -249,7 +263,8 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
     if not ok:
         await write_back(base_token, table_id, rid,
                          {STATUS_FIELD: "待人工确认", "AI备注": "worktree 创建失败：%s" % msg[:200]})
-        return {"id": bug["编号"], "result": "worktree-fail"}
+        return {"id": bug["编号"], "result": "worktree-fail",
+                "reason": "我这边开发环境出了点问题（worktree 没建起来）"}
 
     try:
         # 领单加锁：先把状态改成"修复中"
@@ -257,10 +272,18 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
         res = await _run_claude(build_fix_prompt(bug), cwd=wt)
         reply = parse_worker_reply(res.get("text", ""))
         if reply["outcome"] == "done":
-            await write_back(base_token, table_id, rid,
-                             {STATUS_FIELD: "待发布", "修复分支/PR": reply.get("pr", ""),
-                              "AI备注": reply.get("note", "")})
-            return {"id": bug["编号"], "result": "done", "pr": reply.get("pr")}
+            # 先确认分支真推上去了（claude 可能嘴上说 done 但没 push）
+            if not repo_locate.branch_on_remote(top, branch):
+                await write_back(base_token, table_id, rid,
+                                 {STATUS_FIELD: "待人工确认",
+                                  "AI备注": ("说改完了但分支没推上去，需人工核实。" + reply.get("note", ""))[:200]})
+                return {"id": bug["编号"], "result": "unknown",
+                        "reason": "代码改了但分支没推上去，我再看看 / 麻烦人工核实下"}
+            pr_url = _mr_url(loc["url"], branch)   # 框架确定性构造，不用 claude 给的
+            wrote = await write_back(base_token, table_id, rid,
+                                     {STATUS_FIELD: "待发布", "修复分支/PR": pr_url,
+                                      "AI备注": reply.get("note", "")})
+            return {"id": bug["编号"], "result": "done", "pr": pr_url, "wrote": wrote}
         elif reply["outcome"] == "blocked":
             await write_back(base_token, table_id, rid,
                              {STATUS_FIELD: "待人工确认", "待确认问题": reply.get("question", "")})
@@ -268,7 +291,8 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
         else:
             await write_back(base_token, table_id, rid,
                              {STATUS_FIELD: "待人工确认", "AI备注": "worker 未明确完成：" + reply.get("note", "")[:200]})
-            return {"id": bug["编号"], "result": "unknown"}
+            return {"id": bug["编号"], "result": "unknown",
+                    "reason": "我处理了一下但没完全搞定，麻烦人工看一眼"}
     finally:
         repo_locate.remove_worktree(top, wt)  # 清 worktree，保留分支(供 PR)
 
@@ -282,16 +306,26 @@ async def run_worker(chat_id: str) -> list:
     if not all([base_token, table_id, repo]):
         print("emmy.yaml 缺 base_app_token/base_table_id/repo")
         return []
-    pend = await read_pending(base_token, table_id)
-    print("待修复 %d 条" % len(pend))
-    paired = []
-    for rec in pend:  # 串行：一条条修，稳
-        r = await fix_one(rec, repo, base_token, table_id)
-        paired.append((rec, r))
-        print("  ->", r)
-    if paired:
-        await notify_results(chat_id, paired)  # 修完回群通知 + @提问人（闭环最后一步）
-    return [r for _, r in paired]
+    try:
+        pend = await read_pending(base_token, table_id)
+        print("待修复 %d 条" % len(pend))
+        paired = []
+        for rec in pend:  # 串行：一条条修，稳
+            bug = _field(rec.get("fields") or {})
+            await _send_group(chat_id, "#%s 我开始改了，大概几分钟，改完 @你~ 🛠️" % bug["编号"])  # 开工播报
+            r = await fix_one(rec, repo, base_token, table_id)
+            paired.append((rec, r))
+            print("  ->", r)
+        if paired:
+            await notify_results(chat_id, paired)  # 修完回群通知 + @提问人（闭环最后一步）
+        return [r for _, r in paired]
+    except Exception as e:  # noqa: BLE001 —— 别让 worker 崩了群里就停在「开工啦」没下文
+        print("[worker] 主流程异常: %r" % e, flush=True)
+        try:
+            await _send_group(chat_id, "哎呀我这次没跑通，让 Echo 看下 worker 日志哈~ 🙏")
+        except Exception:  # noqa: BLE001
+            pass
+        return []
 
 
 async def check_ready(chat_id: str) -> None:
@@ -414,12 +448,20 @@ def _selftest() -> None:
     assert _at_markup(members, "") == ""
     print("✓ _at_markup：单一匹配 @、重名/对不上用文本名")
 
-    # 7) 完成通知文案：done/blocked/fail
-    assert "修好啦" in _result_message('<at user_id="o"></at>', "0006", {"result": "done", "pr": "http://pr/1"})
-    assert "http://pr/1" in _result_message("", "0006", {"result": "done", "pr": "http://pr/1"})
+    # 7) 完成通知文案：done / 写失败降级 / blocked / 失败带@和真因
+    assert "修好啦" in _result_message('<at>', "0006", {"result": "done", "pr": "http://pr/1"})
+    assert "没写进去" in _result_message("", "0006", {"result": "done", "pr": "p", "wrote": False})
     assert "拿不准" in _result_message("", "0007", {"result": "blocked", "q": "选哪个改法"})
-    assert "环境出了点问题" in _result_message("", "0008", {"result": "locate-fail"})
-    print("✓ _result_message：done/blocked/fail 文案")
+    fm = _result_message('<at>', "0008", {"result": "locate-fail", "reason": "代码路径好像不对"})
+    assert "<at>" in fm and "代码路径好像不对" in fm
+    print("✓ _result_message：done/写失败降级/blocked/失败带@和真因")
+
+    # 8) _mr_url：框架构造 MR/PR 链接（GitLab / GitHub）
+    gl = _mr_url("https://gitlab.prosperllm.ai/g/p", "bugfix/0006")
+    assert "merge_requests/new" in gl and "bugfix%2F0006" in gl and "target_branch%5D=dev" in gl, gl
+    gh = _mr_url("https://github.com/o/r", "bugfix/0006")
+    assert "/compare/dev...bugfix%2F0006" in gh, gh
+    print("✓ _mr_url 框架构造 MR/PR 链接（GitLab/GitHub）")
 
     print("\nworker 纯逻辑自测全部通过 ✅（端到端真改代码需 emmy.yaml 配好 MASS repo 后一起测）")
 

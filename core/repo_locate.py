@@ -91,6 +91,12 @@ def remove_worktree(repo_path: str, worktree_dir: str) -> None:
     _git(["-C", repo_path, "worktree", "remove", "--force", worktree_dir])
 
 
+def branch_on_remote(repo_path: str, branch: str) -> bool:
+    """分支是否已推到 origin（worker 据此确认 claude 真的 push 了，而不是嘴上说 done）。"""
+    r = _git(["-C", repo_path, "ls-remote", "--heads", "origin", branch], timeout=30)
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
 # ---------------- 自测（python3 core/repo_locate.py）----------------
 def _selftest() -> None:
     # 1) URL 规范化：6 种写法收敛同一 key
