@@ -36,6 +36,8 @@ _ALLOWED_PREFIXES = (
     "im +chat-search", "im +chat-list", "im +chat-messages-list",
     # —— im 消息：写（@通知 / 回复，Emmy 核心能力）——
     "im +messages-send", "im +messages-reply",
+    # —— im 置顶：onboarding 时把 BUG 表入口 pin 到群里 ——
+    "im pins list", "im pins create",
     # —— 联系人：搜人（@ 提问人要用）——
     "contact +search-user",
 )
