@@ -128,6 +128,8 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
    发 → `emmy-lark im +messages-send --as bot --chat-id __CID__ --msg-type text --content '{"text":"📊 BUG 表在这儿：<表链接>"}'`（记下返回的 message_id）
    pin → `emmy-lark im pins create --chat-id __CID__ --message-id <上一步的 message_id>`
 
+4.5) 扫一眼群里的自动化（详见 base-automation 能力）：`emmy-lark base +workflow-list --base-token <t>` 看有没有、什么状态，简短报给群主（发现空壳/禁用的提一句）。要不要按规范建/改，先问群主、别擅自动。
+
 5) 全部 OK 后（意图确认 + 表字段/选项齐 + 置顶好 + repo 拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
 <EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repo":"/绝对/路径","initialized":true}</EMMY_CONFIG>
 **还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
