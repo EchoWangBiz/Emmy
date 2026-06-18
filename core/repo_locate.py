@@ -57,7 +57,7 @@ def repo_toplevel(path: str) -> Optional[str]:
 
 def locate(repo_path: Optional[str], expected_url: Optional[str] = None) -> Optional[dict]:
     """校验 repo_path 是 git 仓库（可选 remote 匹配 expected_url）。
-    命中返回 {toplevel, url}；非 git / 不匹配 / 路径无效 → None（worker 据此决定是否停下问主人，绝不乱 clone）。"""
+    命中返回 {toplevel, url}；非 git / 不匹配 / 路径无效 → None（worker 据此决定是否停下来问一句，绝不乱 clone）。"""
     if not repo_path or not os.path.isdir(repo_path):
         return None
     url = repo_origin(repo_path)
