@@ -144,6 +144,26 @@ def _maybe_save_config(chat_id: str, text: str) -> str:
         return cleaned or text
 
 
+# ── 自动派工：已配置的修 BUG 群里，Emmy 确认并标「待修复」后会在回复末尾吐 <DISPATCH_FIX/> 信号；
+#    框架接住 → 后台起 worker 改代码、提 PR、回写状态、@提问人。Emmy 自己【绝不碰代码】。──
+_DISPATCH_RE = re.compile(r"<DISPATCH_FIX\s*/?>(?:\s*</DISPATCH_FIX>)?")
+_fix_workers: dict = {}   # chat_id -> asyncio.subprocess.Process（防重起）
+
+
+async def _dispatch_fix_worker(chat_id: str) -> bool:
+    """收到派工信号 → 后台起 worker 修代码（该群已有 worker 在跑就不重起；worker 会扫所有待修复）。"""
+    p = _fix_workers.get(chat_id)
+    if p is not None and p.returncode is None:
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, os.path.join(PROJECT_DIR, "core", "worker.py"), chat_id,
+        cwd=PROJECT_DIR,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    _fix_workers[chat_id] = proc
+    print(f"[run] 🛠️ 已为 {chat_id} 起代码侧 worker（pid={proc.pid}）", flush=True)
+    return True
+
+
 def _diagnose(res: dict) -> str:
     """claude 出错时在终端打印详细诊断（含原始输出，方便排查），返回给用户的简短文案。"""
     print(f"[run] ⚠️ claude 出错: {res.get('error')} (returncode={res.get('returncode')})", flush=True)
@@ -201,8 +221,13 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         text = _diagnose(res)
     else:
         text = res["text"] or "（没有返回内容）"
-        if not cc:  # 仅门禁模式才接住配置块并落盘
+        if not cc:  # 门禁模式：接住配置块并落盘
             text = _maybe_save_config(chat_id, text)
+        elif _DISPATCH_RE.search(text):  # 已配置群：接住派工信号 → 后台起 worker 修代码
+            text = _DISPATCH_RE.sub("", text).strip()
+            started = await _dispatch_fix_worker(chat_id)
+            text += ("\n\n🛠️ 代码侧开工啦，修好我来群里通知大家~" if started
+                     else "\n\n🛠️ 代码侧已经在忙这个群的活了，这条排上了，修好通知你~")
     await reply.send(chat_id, text, idempotency_key=msg.get("event_id"))
 
 
