@@ -96,28 +96,46 @@ def _with_chat_context(chat_id: str, content: str) -> str:
 # Emmy 大脑没有写文件权限，只负责【收集 + 在回复末尾吐出 <EMMY_CONFIG> 块】，
 # 真正落盘由这里的框架代码做（只写 emmy.yaml 的 chats[chat_id]，碰不到别的文件）。
 _CONFIG_RE = re.compile(r"<EMMY_CONFIG>\s*(\{.*?\})\s*</EMMY_CONFIG>", re.S)
-_ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo")
+_ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo", "initialized")
+
+
+def _is_initialized(cc: dict) -> bool:
+    """该群是否已走完 onboarding（emmy.yaml 标了 initialized）。兼容 True / 'true' 字符串。"""
+    v = (cc or {}).get("initialized")
+    return v is True or str(v).strip().lower() in ("true", "1", "yes", "done")
 
 
 def _onboard_prompt(chat_id: str, content: str) -> str:
-    """群未配置时给 Emmy 的引导：对话式问全配置，齐了再吐 <EMMY_CONFIG> 块。"""
-    return (
-        "[配置门禁] 这个群我还没配置过（chat_id=%s）。配好之前我的首要任务是"
-        "【引导大家一次性把配置说清楚】，先别急着干别的活。\n"
-        "用我自己活泼的口吻、一次性（别一条条挤牙膏）问全这几样：\n"
-        "1) 这个群想让我干啥？目前我会的是【修 BUG】(role=fix-bug)。\n"
-        "2) 如果是修 BUG，还要两样：\n"
-        "   - BUG 多维表格的【分享链接】发我。链接形如\n"
-        "     https://xxx.feishu.cn/base/<app_token>?table=<table_id>&view=...\n"
-        "     我自己从链接里取 app_token 和 table_id，不用谁手填。\n"
-        "   - 代码项目在电脑上的【绝对路径】（已经 clone 好的那个，例如 /Users/xxx/project/mass）。\n"
-        "信息没给齐就继续追问，【绝不瞎编/猜测/填占位符】。\n"
-        "等齐全了，在【那一条回复的最末尾】附上这个块（对方看不到它，我的框架会接住写进配置）：\n"
-        "<EMMY_CONFIG>{\"name\":\"群备注\",\"role\":\"fix-bug\",\"base_app_token\":\"...\","
-        "\"base_table_id\":\"...\",\"repo\":\"/绝对/路径\"}</EMMY_CONFIG>\n"
-        "信息还没齐就【绝对不要】输出这个块。\n\n"
-        "对方刚说：%s" % (chat_id, content)
-    )
+    """群未初始化时的 onboarding 引导：确认意图 → 自检环境 → 一项项补足 → 标记完成。
+    配好后框架会标 initialized，以后这个群不再走这套。"""
+    tpl = """[入群初始化] 这个群我还没初始化（chat_id=__CID__）。在配好之前我的首要任务是【带大家把这个群一次性配好】，配好我会记下来、以后就不再问。说话照我活泼简洁的风格，别一次甩一大段——按下面的步骤聊着推进，缺啥补啥（已经清楚的别重复问）：
+
+1) 先确认意图：这个群想让我干啥？目前我会【修 BUG】(role=fix-bug)。不是的话就先问清楚。
+
+2) 是修 BUG 的话，要这两样：
+   - BUG 多维表格的【分享链接】（我自己从 .../base/<app_token>?table=<table_id> 里取 token，不用谁手填）
+   - 代码项目在电脑上的【绝对路径】（已 clone 好的，如 /Users/xxx/project/xxx）
+
+3) 拿到表链接后，自检 + 自动补全表格（用 emmy-lark，token 用从链接解析出来的）：
+   - 先 `emmy-lark base +field-list --base-token <t> --table-id <tbl>` 看现有字段
+   - 缺这些就【自动建】(纯新增、低危)：问题编号、提问人、问题摘要、复现/期望/实际、状态、修复分支/PR、AI备注、待确认问题、提问人答复
+     文本字段：`emmy-lark base +field-create --base-token <t> --table-id <tbl> --json '{"name":"AI备注","type":"text"}'`
+     状态字段(select)：`--json '{"name":"状态","type":"select","options":[{"name":"待处理"},{"name":"待修复"},{"name":"修复中"},{"name":"待人工确认"},{"name":"待发布"},{"name":"待验收"},{"name":"已验收"},{"name":"不修"}]}'`
+   - ⚠️ 若【状态】字段已存在但选项不全，我改不了已有字段的选项——这种就明确请群主去多维表格把状态选项补成那 8 个，补好再继续
+   - 必须确保齐的：状态(含 8 选项)、修复分支/PR、AI备注、待确认问题
+
+4) 置顶检查：`emmy-lark im pins list --chat-id __CID__` 看群里 pin 了没；没有就发一条表入口消息再 pin 上，方便大家随时点开：
+   发 → `emmy-lark im +messages-send --as bot --chat-id __CID__ --msg-type text --content '{"text":"📊 BUG 表在这儿：<表链接>"}'`（记下返回的 message_id）
+   pin → `emmy-lark im pins create --chat-id __CID__ --message-id <上一步的 message_id>`
+
+4.5) 扫一眼群里的自动化（详见 base-automation 能力）：`emmy-lark base +workflow-list --base-token <t>` 看有没有、什么状态，简短报给群主（发现空壳/禁用的提一句）。要不要按规范建/改，先问群主、别擅自动。
+
+5) 全部 OK 后（意图确认 + 表字段/选项齐 + 置顶好 + repo 拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
+<EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repo":"/绝对/路径","initialized":true}</EMMY_CONFIG>
+**还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
+
+对方刚说：__CONTENT__"""
+    return tpl.replace("__CID__", chat_id).replace("__CONTENT__", content)
 
 
 def _maybe_save_config(chat_id: str, text: str) -> str:
@@ -233,17 +251,18 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         await reply.send(chat_id, text, idempotency_key=msg.get("event_id"))
         return
 
-    # 群聊：配置门禁（没配过 → 引导收集；配好了 → 注入群上下文正常干活）
-    prompt = _with_chat_context(chat_id, content) if cc else _onboard_prompt(chat_id, content)
+    # 群聊：入群初始化闸（没初始化过 → onboarding 自检引导；初始化完成 → 注入群上下文正常干活）
+    inited = _is_initialized(cc)
+    prompt = _with_chat_context(chat_id, content) if inited else _onboard_prompt(chat_id, content)
     res = await claude_runner.run(
         prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
     if res["is_error"]:
         text = _diagnose(res)
     else:
         text = res["text"] or "（没有返回内容）"
-        if not cc:  # 门禁模式：接住配置块并落盘
+        if not inited:  # onboarding 模式：接住配置块并落盘（含 initialized 标记）
             text = _maybe_save_config(chat_id, text)
-        elif _DISPATCH_RE.search(text):  # 已配置群：接住派工信号 → 后台起 worker 修代码
+        elif _DISPATCH_RE.search(text):  # 已初始化群：接住派工信号 → 后台起 worker 修代码
             text = _DISPATCH_RE.sub("", text).strip()
             started = await _dispatch_fix_worker(chat_id)
             text += ("\n\n🛠️ 代码侧开工啦，修好我来群里通知大家~" if started

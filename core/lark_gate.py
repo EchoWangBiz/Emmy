@@ -36,8 +36,16 @@ _ALLOWED_PREFIXES = (
     "im +chat-search", "im +chat-list", "im +chat-messages-list",
     # —— im 消息：写（@通知 / 回复，Emmy 核心能力）——
     "im +messages-send", "im +messages-reply",
+    # —— im 置顶：onboarding 时把 BUG 表入口 pin 到群里 ——
+    "im pins list", "im pins create",
     # —— 联系人：搜人（@ 提问人要用）——
     "contact +search-user",
+    # —— 表格自动化：检测/维护/按规范建（base-automation 能力）——
+    "base +workflow-list", "base +workflow-get",
+    "base +workflow-create", "base +workflow-update",
+    "base +workflow-enable", "base +workflow-disable",
+    # —— 读 lark-cli 自带文档（建自动化前学 steps 格式，只读）——
+    "skills read",
 )
 _BATCH_WRITE_PREFIX = "base +record-batch-update"   # 白名单内但需 fail-closed 阈值核验
 
@@ -106,6 +114,11 @@ def _selftest() -> None:
     assert not blocked(["im", "+messages-resources-download", "--message-id", "om_x", "--file-key", "f"])
     assert not blocked(["contact", "+search-user", "--query", "张三"])
     assert not blocked(["im", "--help"])
+    assert not blocked(["im", "pins", "list", "--chat-id", "oc_x"])
+    assert not blocked(["im", "pins", "create", "--chat-id", "oc_x", "--message-id", "om_x"])
+    assert not blocked(["base", "+workflow-list", "--base-token", "t"])
+    assert not blocked(["base", "+workflow-create", "--base-token", "t", "--json", "@w.json"])
+    assert not blocked(["skills", "read", "lark-base-workflow-guide"])
     assert not blocked(["base", "+record-batch-update", "--base-token", "t", "--table-id", "tb",
                         "--json", '{"record_id_list":["rec1"],"patch":{"状态":"待修复"}}'])
     print("✓ 放行：base/im/contact 白名单内读写 + 单条批量改 + --help")
