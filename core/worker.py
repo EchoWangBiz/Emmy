@@ -27,9 +27,9 @@ from core import claude_runner, config, repo_locate  # noqa: E402
 PIPE = asyncio.subprocess.PIPE
 
 # worker 的 claude 权限：放开改代码要用的，仍挡破坏性命令
-WORKER_ALLOWED = ("Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(yarn:*) Bash(pnpm:*) "
+WORKER_ALLOWED = ("Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(yarn:*) Bash(pnpm:*) Bash(bun:*) "
                   "Bash(python3:*) Bash(node:*) Bash(ls:*) Bash(cat:*) Bash(grep:*) "
-                  "Bash(rg:*) Bash(find:*) Edit Write Read")
+                  "Bash(rg:*) Bash(find:*) Bash(tail:*) Bash(head:*) Bash(wc:*) Edit Write Read")
 WORKER_DISALLOWED = ["Bash(rm:*)", "Bash(sudo:*)", "Bash(curl:*)", "Bash(ssh:*)", "Bash(git push origin dev:*)"]
 
 STATUS_FIELD = "状态"
@@ -50,8 +50,13 @@ def build_fix_prompt(bug: dict, base_branch: str = "dev") -> str:
         "你的改动不会影响别人的工作副本，放心改。\n\n"
         "要修的 BUG：\n"
         "  编号: %s\n  摘要: %s\n  详情(复现/期望/实际): %s\n%s\n"
+        "⚠️【无人值守环境，务必照做】你是后台自动跑的、没有人能给你点『批准』：\n"
+        "   - 任何需要审批的命令都会被【直接拦住】、把你卡死——【绝对不要】跑测试套件、构建、dev server "
+        "（bun/npm/yarn run test、build、dev、start 这类），它们要么被拦、要么太慢会让你超时。\n"
+        "   - 验证交给 CI 和 PR review，【不是你这一步要做的】。你只管：定位 → 改最小必要的代码 → 提交 → 推分支。\n"
+        "   - bash 命令尽量【单条、别套管道/复合】（`a | b`、`a && b` 里只要有一段不在白名单也会触发审批卡住）。\n\n"
         "请按这个流程：\n"
-        "1. 读懂相关代码、定位问题根因。\n"
+        "1. 读懂相关代码、定位问题根因（用 Read/grep/find，别跑测试）。\n"
         "2. 在【当前分支】改代码修复（已是独立 bugfix 分支）。\n"
         "3. git add + git commit（message 写清改了啥）。\n"
         "4. 提交后推分支：git push -u origin <当前分支>。\n"
