@@ -225,14 +225,16 @@ def _diagnose(res: dict) -> str:
 
 async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     chat_id = msg["chat_id"]
+    sender_id = msg.get("sender_id") or ""
     content = (msg.get("content") or "").strip()
     file_ids = msg.get("file_message_ids") or []
     is_p2p = msg.get("chat_type") == "p2p"
     cc = None if is_p2p else config.chat_config(chat_id)
+    at = None if is_p2p else (sender_id or None)   # 群聊回复 @ 回发言人（区分这话是冲谁说的）；私聊不 @
 
     # 纯空消息（既没文字又没文件）→ 温和提示，不 ack、不调 claude
     if not content and not file_ids:
-        await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"))
+        await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"), at_user_id=at)
         return
 
     # 注：群聊的「队列播报」第一段由 ChatDispatcher.submit 在入队时已发（私聊不播报），这里直接干活。
@@ -245,17 +247,19 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
 
     # 读完文件仍没有任何可用内容（图片/读不了的文件且无文字）→ 温和提示
     if not content:
-        await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"))
+        await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"), at_user_id=at)
         return
 
-    resume = chat_id in _seen_chats
-    _seen_chats.add(chat_id)
+    # 续聊判定按「群+发言人」：同群不同人各自独立 session（claude_runner 也按发言人派生 session_id）
+    conv = _conv_key(msg)
+    resume = conv in _seen_chats
+    _seen_chats.add(conv)
 
     # 私聊（p2p）：正常跟 Claude Code 对话——精简 system prompt（不带群里的 BUG 能力）+ 私聊定位
     if is_p2p:
         res = await claude_runner.run(
             P2P_PREFIX + content, chat_id, resume=resume,
-            system_prompt=system_prompt_p2p, cwd=PROJECT_DIR)
+            system_prompt=system_prompt_p2p, cwd=PROJECT_DIR, sender_id=sender_id)
         text = _diagnose(res) if res["is_error"] else (res["text"] or "（没有返回内容）")
         await reply.send(chat_id, text, idempotency_key=msg.get("event_id"))
         return
@@ -264,7 +268,7 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     inited = _is_initialized(cc)
     prompt = _with_chat_context(chat_id, content) if inited else _onboard_prompt(chat_id, content)
     res = await claude_runner.run(
-        prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR)
+        prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR, sender_id=sender_id)
     if res["is_error"]:
         text = _diagnose(res)
     else:
@@ -276,7 +280,7 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
             started = await _dispatch_fix_worker(chat_id)
             text += ("\n\n🛠️ 代码侧开工啦，修好我来群里通知大家~" if started
                      else "\n\n🛠️ 代码侧已经在忙这个群的活了，这条排上了，修好通知你~")
-    await reply.send(chat_id, text, idempotency_key=msg.get("event_id"))
+    await reply.send(chat_id, text, idempotency_key=msg.get("event_id"), at_user_id=at)
 
 
 # ── 消息聚合：飞书连发多条（如一次拖几个文件、或分几段说）会到达成多个独立事件；
@@ -284,6 +288,11 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
 #    注：一窗口内全是非文本（图片/文件，content 为空）的批次合并后内容为空，由 handle 回一句温和提示。──
 AGGREGATE_DELAY = 1.2       # 秒：窗口内同一 chat 的新消息都并进来，最后一条到齐后再触发
 AGGREGATE_MAX_WAIT = 8.0    # 秒：硬上限——从该批首条算起最多攒这么久就强制触发，避免持续连发被无限延后
+
+
+def _conv_key(msg: dict) -> str:
+    """会话隔离 key：同一群里按发言人分开（群级数据如表/状态仍共享，但对话上下文/队列各自独立、不串味）。"""
+    return "%s:%s" % (msg.get("chat_id", ""), msg.get("sender_id") or "")
 
 
 def _merge_msgs(msgs: list) -> dict:
@@ -313,7 +322,7 @@ class Debouncer:
         self._first_ts: dict = {}    # chat_id -> 该批首条到达的单调时钟
 
     def feed(self, msg: dict) -> None:
-        cid = msg["chat_id"]
+        cid = _conv_key(msg)   # 按「群+发言人」聚合：同群不同人不合并成一条
         buf = self._buf.setdefault(cid, [])
         if not buf:
             self._first_ts[cid] = time.monotonic()
@@ -358,10 +367,10 @@ def _queue_ack(ahead: int, active: int) -> str:
 
 
 class ChatDispatcher:
-    """按 chat_id 分独立串行队列调度：
-      - 同一个群【串行】（一条处理完再下一条）—— 保住该群 claude session 不被并发写坏；
-      - 不同群【并行】—— 群 A 不再阻塞群 B；
-      - 全局 Semaphore 限并发 —— 同时在跑的群数有上限，超出的排队等。"""
+    """按「群+发言人」(conv_key) 分独立串行队列调度：
+      - 同一个发言人【串行】（一条处理完再下一条）—— 保住其 claude session 不被并发写坏；
+      - 同群不同人 / 不同群【并行】—— 一个人不再阻塞另一个人；
+      - 全局 Semaphore 限并发 —— 同时在跑的会话数有上限，超出的排队等。"""
 
     def __init__(self, handle_fn, system_prompt: str, system_prompt_p2p: str,
                  max_concurrent: int = MAX_CONCURRENT_CHATS) -> None:
@@ -369,40 +378,42 @@ class ChatDispatcher:
         self._sp = system_prompt
         self._sp_p2p = system_prompt_p2p
         self._sem = asyncio.Semaphore(max_concurrent)
-        self._queues: dict = {}    # chat_id -> asyncio.Queue
-        self._tasks: dict = {}     # chat_id -> asyncio.Task（每个群一个串行消费者）
-        self._active: set = set()  # 正在跑 handle 的 chat_id（算"几个群在忙"）
+        self._queues: dict = {}    # conv_key -> asyncio.Queue
+        self._tasks: dict = {}     # conv_key -> asyncio.Task（每个发言人一个串行消费者）
+        self._active: set = set()  # 正在跑 handle 的 conv_key（算"几个会话在忙"）
 
     async def submit(self, msg: dict) -> None:
-        cid = msg["chat_id"]
-        q = self._queues.get(cid)
-        ahead = q.qsize() if q is not None else 0   # 入队前，该群前面还等着几条
+        key = _conv_key(msg)   # 按「群+发言人」分独立队列：同群不同人各自串行、互不阻塞
+        q = self._queues.get(key)
+        ahead = q.qsize() if q is not None else 0   # 入队前，自己前面还等着几条
         if q is None:
             q = asyncio.Queue()
-            self._queues[cid] = q
-            self._tasks[cid] = asyncio.create_task(self._run_chat(cid, q))
-        # 群聊 + 有实质内容：刚收到就先「播报队列情况」（私聊/空消息不播报）
+            self._queues[key] = q
+            self._tasks[key] = asyncio.create_task(self._run_chat(key, q))
+        # 群聊 + 有实质内容：刚收到就先「播报队列情况」+ @发言人（私聊/空消息不播报）
         has_content = bool((msg.get("content") or "").strip()) or bool(msg.get("file_message_ids"))
         if msg.get("chat_type") != "p2p" and has_content:
-            await reply.send(cid, _queue_ack(ahead, len(self._active)),
-                             idempotency_key=(msg.get("event_id") or "") + ":ack")
+            await reply.send(msg["chat_id"], _queue_ack(ahead, len(self._active)),
+                             idempotency_key=(msg.get("event_id") or "") + ":ack",
+                             at_user_id=msg.get("sender_id"))
         await q.put(msg)
 
-    async def _run_chat(self, cid: str, q: "asyncio.Queue") -> None:
+    async def _run_chat(self, key: str, q: "asyncio.Queue") -> None:
         while True:
             msg = await q.get()
             try:
                 async with self._sem:   # 占一个全局并发名额（满了就在这等）
-                    self._active.add(cid)
+                    self._active.add(key)
                     try:
                         await self._handle(msg, self._sp, self._sp_p2p)
                     finally:
-                        self._active.discard(cid)
-            except Exception as e:      # 单条失败不拖垮该群、更不拖垮别的群
-                print(f"[run] handle error ({cid}): {e}", flush=True)
-                try:  # 别让用户「没后续」——出错也回一句，至少有反馈
-                    await reply.send(cid, "哎呀我这边卡了一下下，稍后再喊我一次试试？🙏",
-                                     idempotency_key=(msg.get("event_id") or "") + ":err")
+                        self._active.discard(key)
+            except Exception as e:      # 单条失败不拖垮该发言人、更不拖垮别人
+                print(f"[run] handle error ({key}): {e}", flush=True)
+                try:  # 别让用户「没后续」——出错也回一句，至少有反馈（群聊 @ 回发言人）
+                    await reply.send(msg["chat_id"], "哎呀我这边卡了一下下，稍后再喊我一次试试？🙏",
+                                     idempotency_key=(msg.get("event_id") or "") + ":err",
+                                     at_user_id=(msg.get("sender_id") if msg.get("chat_type") != "p2p" else None))
                 except Exception:
                     pass
             finally:
