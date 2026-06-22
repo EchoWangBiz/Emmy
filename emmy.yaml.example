@@ -14,7 +14,11 @@ chats:
     role: fix-bug                     # 能力角色：fix-bug（后续可加 daily-report 等）
     base_app_token: bascn_xxxxxxxxxx  # BUG 多维表格的 app-token（base-token）
     base_table_id:  tblxxxxxxxxxx     # 表 id
-    repo: /Users/echo/project/mass    # 本地已 clone 的项目【绝对路径】（给 worker，避免重复 clone）
+    # 仓库：单仓用 repo，多仓（前端+后端）用 repos（模块名→本地绝对路径，worker 按 BUG「所属模块」路由）
+    # repo: /Users/echo/project/mass
+    repos:
+      前端: /Users/echo/project/llm-platform-web
+      后端: /Users/echo/project/llm-platform
 
 # 全局默认（可选）
 defaults:
