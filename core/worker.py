@@ -347,6 +347,10 @@ async def run_worker(chat_id: str) -> list:
             if not pend:
                 break
             print("待修复 %d 条（第 %d 轮）" % (len(pend), _round + 1))
+            if _round == 0 and len(pend) > 1:  # 批量任务：先宣布计划
+                nums = "、".join("#" + _field(r.get("fields") or {})["编号"] for r in pend)
+                await _send_group(chat_id, "我看了下，这批有 %d 条要修（%s）~ 我排着一条条来，每条改完都 @对应的人验收哈 🛠️"
+                                  % (len(pend), nums))
             for rec in pend:  # 串行：一条条修，稳
                 seen.add(rec["record_id"])
                 bug = _field(rec.get("fields") or {})
