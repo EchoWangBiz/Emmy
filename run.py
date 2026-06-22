@@ -125,13 +125,13 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
    - ⚠️ 若【状态】字段已存在但选项不全，我改不了已有字段的选项——这种就明确请群主去多维表格把状态选项补成那 8 个，补好再继续
    - 必须确保齐的：状态(含 8 选项)、修复分支/PR、AI备注、待确认问题
 
-4) 置顶检查：`emmy-lark im pins list --chat-id __CID__` 看群里 pin 了没；没有就发一条表入口消息再 pin 上，方便大家随时点开：
+4) 表入口检查（非必须、可跳过）：先看群顶部是不是已经能找到这张 BUG 表的入口——不管是【消息 Pin】(`emmy-lark im pins list --chat-id __CID__`)、还是群顶部那排【文档标签页 / 云文档置顶】。只要已经有任一种入口能点开这张表，就别再重复发 / pin，跳过这步即可；确实一个入口都没有时，再发一条表入口消息并 pin 上：
    发 → `emmy-lark im +messages-send --as bot --chat-id __CID__ --msg-type text --content '{"text":"📊 BUG 表在这儿：<表链接>"}'`（记下返回的 message_id）
    pin → `emmy-lark im pins create --chat-id __CID__ --message-id <上一步的 message_id>`
 
-4.5) 扫一眼群里的自动化（详见 base-automation 能力）：`emmy-lark base +workflow-list --base-token <t>` 看有没有、什么状态，简短报给群主（发现空壳/禁用的提一句）。要不要按规范建/改，先问群主、别擅自动。
+4.5) 扫一眼群里的【多维表格·工作流】（详见 base-automation 能力）：`emmy-lark base +workflow-list --base-token <t>` 看有没有，**只如实转述**（有 N 条、启没启用）。⚠️ 这只能读到「工作流(workflow)」那套，**读不到群主在「自动化中心」配的自动化**——所以别对自动化中心下「空壳 / 没触发器 / 禁用」这类结论，读不到就老实说「自动化中心我这边自检不了，你自己核对下」。要不要按规范建/改 workflow，先问群主、别擅自动。
 
-5) 全部 OK 后（意图确认 + 表字段/选项齐 + 置顶好 + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
+5) 全部 OK 后（意图确认 + 表字段/选项齐 + 群里能找到表入口[已置顶或已有文档标签页即可，没有也不强求] + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
 <EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"initialized":true}</EMMY_CONFIG>
 （只有一个仓就 repos 里写一个；模块名尽量用表里「所属模块」会出现的值，worker 据此按模块路由）
 **还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
@@ -147,27 +147,28 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
     return tpl.replace("__CID__", chat_id).replace("__CONTENT__", content)
 
 
-def _maybe_save_config(chat_id: str, text: str) -> str:
-    """门禁模式下：若 Emmy 回复里带 <EMMY_CONFIG> 块，解析并落盘，再从给用户的回复里抹掉它。"""
+def _maybe_save_config(chat_id: str, text: str) -> tuple:
+    """门禁模式下：若 Emmy 回复里带 <EMMY_CONFIG> 块，解析并落盘，再从给用户的回复里抹掉它。
+    返回 (清洗后的文本, 本轮是否真的落盘了配置)——调用方据后者判断「这一轮是不是刚把群配好」。"""
     m = _CONFIG_RE.search(text)
     if not m:
-        return text
+        return text, False
     cleaned = (text[:m.start()] + text[m.end():]).strip()
     try:
         cfg = json.loads(m.group(1))
     except Exception as e:  # noqa: BLE001
         print(f"[run] ⚠️ 门禁配置块解析失败: {e}", flush=True)
-        return cleaned or text  # 至少别把原始 JSON 块发给用户
+        return cleaned or text, False  # 至少别把原始 JSON 块发给用户
     allowed = {k: cfg[k] for k in _ALLOWED_KEYS if cfg.get(k)}
     if not allowed.get("role"):
-        return cleaned or text
+        return cleaned or text, False
     try:
         path = config.set_chat_config(chat_id, allowed)
         print(f"[run] ✓ 已写入群配置 {chat_id} -> {path}: {allowed}", flush=True)
-        return (cleaned + "\n\n（配置我记好啦~ 以后这个群直接喊我干活就行 🦊）").strip()
+        return (cleaned + "\n\n（配置我记好啦~ 以后这个群直接喊我干活就行 🦊）").strip(), True
     except Exception as e:  # noqa: BLE001
         print(f"[run] ⚠️ 写配置失败: {e}", flush=True)
-        return cleaned or text
+        return cleaned or text, False
 
 
 # ── 自动派工：已配置的修 BUG 群里，Emmy 确认并标「待修复」后会在回复末尾吐 <DISPATCH_FIX/> 信号；
@@ -273,10 +274,22 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         text = _diagnose(res)
     else:
         text = res["text"] or "（没有返回内容）"
+        # 派工信号是【内部信号、对用户不可见】——任何分支都先无条件剥离，绝不外泄给群里；
+        # 是否命中要在剥离前记下来（剥离后就搜不到了）。
+        had_signal = bool(_DISPATCH_RE.search(text))
+        text = _DISPATCH_RE.sub("", text).strip()
         if not inited:  # onboarding 模式：接住配置块并落盘（含 initialized 标记）
-            text = _maybe_save_config(chat_id, text)
-        elif _DISPATCH_RE.search(text):  # 已初始化群：接住派工信号 → 后台起 worker 修代码
-            text = _DISPATCH_RE.sub("", text).strip()
+            text, just_saved = _maybe_save_config(chat_id, text)
+            # 刚把修 BUG 群配好这一轮：顺手起一次 worker 扫表——onboarding 期间可能已把
+            # 某些 BUG 标了「待修复」（但当时没派工），worker 是扫表型、会把它们一并扫修；
+            # 表里没有待修的就静默退出，不会刷屏。
+            if just_saved:
+                cc2 = config.chat_config(chat_id) or {}
+                repos2 = cc2.get("repos") or ({"_": cc2.get("repo")} if cc2.get("repo") else {})
+                if _is_initialized(cc2) and cc2.get("role") == "fix-bug" and repos2:
+                    if await _dispatch_fix_worker(chat_id):
+                        text += "\n\n🛠️ 群配好啦，我顺手把表里待修的过一遍，有就开修、修好挨个通知~"
+        elif had_signal:  # 已初始化群：接住派工信号 → 后台起 worker 修代码
             started = await _dispatch_fix_worker(chat_id)
             text += ("\n\n🛠️ 代码侧开工啦，修好我来群里通知大家~" if started
                      else "\n\n🛠️ 代码侧已经在忙这个群的活了，这条排上了，修好通知你~")
