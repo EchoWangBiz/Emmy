@@ -448,12 +448,15 @@ def _acquire_single_instance_lock(path: Optional[str] = None):
         d = os.path.expanduser("~/.emmy")
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, "run.lock")
-    fh = open(path, "w")
+    # 用 "a+" 打开（不截断）——抢锁失败的进程不会把持锁者写的 pid 冲掉；拿到锁后再清空写自己的 pid。
+    fh = open(path, "a+")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         fh.close()
         return None
+    fh.seek(0)
+    fh.truncate()
     fh.write(str(os.getpid()))
     fh.flush()
     _LOCK_FH = fh
