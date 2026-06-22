@@ -43,11 +43,13 @@ WORKTREE_BASE = os.path.expanduser("~/.emmy/worktrees")
 # ---------------- prompt ----------------
 def build_fix_prompt(bug: dict, base_branch: str = "dev") -> str:
     """给 worker 的 claude 的修复指引（含 git-workflow 约束 + DONE/BLOCKED 输出契约）。"""
+    extra = ("  ⚠️ 这条之前卡在「待人工确认」、提问人已补充：%s —— 按这个补充信息接着修。\n"
+             % bug["答复"]) if bug.get("答复") else ""
     return (
         "你是代码侧的修复 agent，当前目录是一个 git worktree（基于 %s 切出的独立 bugfix 分支），"
         "你的改动不会影响别人的工作副本，放心改。\n\n"
         "要修的 BUG：\n"
-        "  编号: %s\n  摘要: %s\n  详情(复现/期望/实际): %s\n\n"
+        "  编号: %s\n  摘要: %s\n  详情(复现/期望/实际): %s\n%s\n"
         "请按这个流程：\n"
         "1. 读懂相关代码、定位问题根因。\n"
         "2. 在【当前分支】改代码修复（已是独立 bugfix 分支）。\n"
@@ -60,7 +62,7 @@ def build_fix_prompt(bug: dict, base_branch: str = "dev") -> str:
         "最后一行必须是下面两种之一(便于我解析)：\n"
         "  DONE: <PR链接> | <一句话改了啥>\n"
         "  BLOCKED: <你拿不准的具体问题>\n"
-        % (base_branch, bug.get("编号", "?"), bug.get("摘要", ""), bug.get("详情", ""),
+        % (base_branch, bug.get("编号", "?"), bug.get("摘要", ""), bug.get("详情", ""), extra,
            base_branch, base_branch, base_branch)
     )
 
@@ -121,26 +123,31 @@ def _flatten(val):
     return str(val)
 
 
+def _should_fix(fields: dict) -> bool:
+    """worker 该处理这条吗：待修复(首次) 或 待人工确认+提问人答复非空(补充后续修，BLOCKED 回路)。"""
+    st = str(fields.get(STATUS_FIELD, "")).strip()
+    if st == "待修复":
+        return True
+    return st == "待人工确认" and bool(str(fields.get("提问人答复", "")).strip())
+
+
 def pending_records(listing: dict) -> list:
-    """从 record-list 返回里挑出 状态=待修复 的记录（纯函数，便于单测）。
-    兼容 lark-cli 的【表格式】（data.fields 列名 + data.data 二维值 + data.record_id_list）
-    与飞书原生【items】两种返回结构。"""
+    """挑出 worker 该处理的记录（待修复 + 补充答复后待续修的）。纯函数。
+    兼容 lark-cli 的【表格式】（data.fields + data.data 二维值 + data.record_id_list）与【items】两种结构。"""
     data = (listing or {}).get("data") or {}
     out = []
     if isinstance(data.get("data"), list) and data.get("fields"):
-        # 表格式：每行是一个值数组，按 fields 列名对位
         fields = data["fields"]
         rids = data.get("record_id_list") or []
         for row, rid in zip(data["data"], rids):
             rf = {name: _flatten(v) for name, v in zip(fields, row)}
-            if str(rf.get(STATUS_FIELD, "")).strip() == "待修复":
+            if _should_fix(rf):
                 out.append({"record_id": rid, "fields": rf})
         return out
-    # items 格式（兼容）
     items = data.get("items") or (listing or {}).get("items") or []
     for it in items:
         fields = it.get("fields") or {}
-        if str(fields.get(STATUS_FIELD, "")).strip() == "待修复":
+        if _should_fix(fields):
             out.append({"record_id": it.get("record_id") or it.get("id"), "fields": fields})
     return out
 
@@ -245,6 +252,7 @@ def _field(bug_fields: dict) -> dict:
         "详情": " | ".join(str(f.get(k, "")) for k in
                           ("复现步骤", "期望", "实际", "复现/期望/实际", "问题内容", "问题类型", "所属模块")
                           if f.get(k)),
+        "答复": f.get("提问人答复") or "",   # BLOCKED 续修时把提问人补充并进 prompt
     }
 
 
@@ -557,6 +565,15 @@ def _selftest() -> None:
     assert _pick_repo({"前端": "/web", "后端": "/srv"}, "其他") is None  # 多仓匹配不出 → 交 BLOCKED
     assert _pick_repo({}, "x") is None
     print("✓ _pick_repo 多仓路由（单仓/模块匹配/匹配不出）")
+
+    # 11) BLOCKED 续修：待人工确认+提问人答复非空 才续修；答复并进 prompt
+    assert _should_fix({"状态": "待修复"})
+    assert _should_fix({"状态": "待人工确认", "提问人答复": "用第二种改法"})
+    assert not _should_fix({"状态": "待人工确认", "提问人答复": ""})  # 没补充就不续
+    assert not _should_fix({"状态": "待处理"})
+    bp = build_fix_prompt({"编号": "6", "摘要": "x", "详情": "y", "答复": "用方案B"})
+    assert "用方案B" in bp and "提问人已补充" in bp
+    print("✓ BLOCKED 续修：_should_fix 判定 + build_fix_prompt 带补充答复")
 
     print("\nworker 纯逻辑自测全部通过 ✅（端到端真改代码需 emmy.yaml 配好 MASS repo 后一起测）")
 
