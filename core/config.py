@@ -93,7 +93,12 @@ def _dump_yaml(cfg: dict) -> str:
     for cid, c in chats.items():
         out.append("  %s:" % cid)
         for k, v in (c or {}).items():
-            out.append("    %s: %s" % (k, _quote(v)))
+            if isinstance(v, dict):   # 二层嵌套，如 repos: {前端: /p, 后端: /p}
+                out.append("    %s:" % k)
+                for kk, vv in v.items():
+                    out.append("      %s: %s" % (kk, _quote(vv)))
+            else:
+                out.append("    %s: %s" % (k, _quote(v)))
     defaults = cfg.get("defaults")
     if defaults:
         out.append("defaults:")

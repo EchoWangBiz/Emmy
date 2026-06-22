@@ -248,6 +248,21 @@ def _field(bug_fields: dict) -> dict:
     }
 
 
+def _pick_repo(repos: dict, module: str):
+    """按 BUG 的「所属模块」选 repo 路径。repos: {模块名: 路径}。
+    只一个仓 → 直接用；多个 → 按模块名模糊匹配；匹配不出 → None（交 BLOCKED 让提问人指定）。纯函数。"""
+    repos = {k: v for k, v in (repos or {}).items() if v}
+    if not repos:
+        return None
+    if len(repos) == 1:
+        return next(iter(repos.values()))
+    m = (module or "").strip()
+    for name, path in repos.items():
+        if m and (name in m or m in name):
+            return path
+    return None
+
+
 # ---------------- MR/PR 链接（框架确定性构造，不靠 claude 编）----------------
 def _mr_url(repo_url: str, branch: str, base: str = "dev") -> str:
     """构造 MR/PR 创建链接。claude 从 push 输出抠链接不可靠（分支已存在时抠不到会瞎编成
@@ -323,9 +338,12 @@ async def run_worker(chat_id: str) -> list:
     if not cc or cc.get("role") != "fix-bug":
         print("chat %s 未配置为 fix-bug 群（检查 emmy.yaml）" % chat_id)
         return []
-    base_token, table_id, repo = cc.get("base_app_token"), cc.get("base_table_id"), cc.get("repo")
-    if not all([base_token, table_id, repo]):
-        print("emmy.yaml 缺 base_app_token/base_table_id/repo")
+    base_token, table_id = cc.get("base_app_token"), cc.get("base_table_id")
+    # 多 repo：优先 repos(dict 模块名→路径)，兼容旧的单值 repo
+    repos = cc.get("repos") or ({"默认": cc.get("repo")} if cc.get("repo") else {})
+    repos = {k: v for k, v in repos.items() if v}
+    if not (base_token and table_id and repos):
+        print("emmy.yaml 缺 base_app_token/base_table_id/repos(或 repo)")
         return []
     # 开工前置硬校验：表格缺字段/缺状态选项就别白跑一趟，回群精确指出让群主补
     missing_f, missing_o = await check_table_schema(base_token, table_id)
@@ -354,8 +372,20 @@ async def run_worker(chat_id: str) -> list:
             for rec in pend:  # 串行：一条条修，稳
                 seen.add(rec["record_id"])
                 bug = _field(rec.get("fields") or {})
+                # 多 repo：按「所属模块」路由到对的仓库；路由不出来就 BLOCKED、让提问人指定
+                module = (rec.get("fields") or {}).get("所属模块", "")
+                repo_path = _pick_repo(repos, module)
+                if not repo_path:
+                    await write_back(base_token, table_id, rec["record_id"],
+                                     {STATUS_FIELD: "待人工确认",
+                                      "待确认问题": "不确定改哪个仓库（所属模块=%s，可选：%s），帮我指定下~"
+                                      % (module or "(空)", " / ".join(repos))})
+                    paired.append((rec, {"id": bug["编号"], "result": "blocked",
+                                         "q": "不确定改哪个仓库，需指定模块"}))
+                    print("  -> route-fail", bug["编号"])
+                    continue
                 await _send_group(chat_id, "#%s 我开始改了，大概几分钟，改完 @你~ 🛠️" % bug["编号"])  # 开工播报
-                r = await fix_one(rec, repo, base_token, table_id)
+                r = await fix_one(rec, repo_path, base_token, table_id)
                 paired.append((rec, r))
                 print("  ->", r)
         if paired:
@@ -381,23 +411,27 @@ async def check_ready(chat_id: str) -> None:
         return
     if cc.get("role") != "fix-bug":
         print("  ✗ 该群 role 不是 fix-bug"); ok = False
-    miss = [k for k in ("base_app_token", "base_table_id", "repo") if not cc.get(k)]
+    miss = [k for k in ("base_app_token", "base_table_id") if not cc.get(k)]
+    repos = cc.get("repos") or ({"默认": cc.get("repo")} if cc.get("repo") else {})
+    repos = {k: v for k, v in repos.items() if v}
+    if not repos:
+        miss.append("repos(或 repo)")
     if miss:
         print("  ✗ 群配置缺: %s" % ", ".join(miss)); ok = False
     else:
-        print("  ✓ 群配置齐全（role/base/repo）")
+        print("  ✓ 群配置齐全（role/base/%d 个仓库）" % len(repos))
 
-    repo = cc.get("repo")
-    loc = repo_locate.locate(repo) if repo else None
-    if loc:
-        print("  ✓ 项目定位: %s" % loc["url"])
+    for name, repo in repos.items():
+        loc = repo_locate.locate(repo)
+        if not loc:
+            print("  ✗ [%s] 不是有效 git 仓库: %s" % (name, repo)); ok = False
+            continue
         r = subprocess.run(["git", "-C", loc["toplevel"], "rev-parse", "--verify", "dev"],
                            capture_output=True)
-        print("  ✓ dev 分支存在" if r.returncode == 0
-              else "  ✗ 没有 dev 分支（worker 从 dev 切子分支）")
-        ok = ok and r.returncode == 0
-    elif repo:
-        print("  ✗ repo 路径不是有效 git 仓库: %s" % repo); ok = False
+        if r.returncode == 0:
+            print("  ✓ [%s] 定位 %s（dev 分支在）" % (name, loc["url"]))
+        else:
+            print("  ✗ [%s] 没有 dev 分支（worker 从 dev 切子分支）" % name); ok = False
 
     cp = subprocess.run(["claude", "-p", "ok", "--output-format", "json"],
                         capture_output=True, text=True)
@@ -515,6 +549,14 @@ def _selftest() -> None:
                        {"name": "修复分支/PR"}, {"name": "AI备注"}, {"name": "待确认问题"}]}
     assert _schema_gaps(full) == ([], []), _schema_gaps(full)
     print("✓ _schema_gaps 校验缺字段/缺状态选项（开工前置）")
+
+    # 10) _pick_repo：单仓直接用 / 多仓按模块匹配 / 匹配不出 None
+    assert _pick_repo({"默认": "/p"}, "随便") == "/p"
+    assert _pick_repo({"前端": "/web", "后端": "/srv"}, "前端登录页") == "/web"
+    assert _pick_repo({"前端": "/web", "后端": "/srv"}, "后端") == "/srv"
+    assert _pick_repo({"前端": "/web", "后端": "/srv"}, "其他") is None  # 多仓匹配不出 → 交 BLOCKED
+    assert _pick_repo({}, "x") is None
+    print("✓ _pick_repo 多仓路由（单仓/模块匹配/匹配不出）")
 
     print("\nworker 纯逻辑自测全部通过 ✅（端到端真改代码需 emmy.yaml 配好 MASS repo 后一起测）")
 

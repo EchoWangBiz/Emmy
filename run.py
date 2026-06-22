@@ -87,8 +87,9 @@ def _with_chat_context(chat_id: str, content: str) -> str:
     if cc.get("base_app_token"):
         lines.append("- BUG表 base-token: %s  table-id: %s"
                      % (cc["base_app_token"], cc.get("base_table_id", "")))
-    if cc.get("repo"):
-        lines.append("- 项目 repo: %s" % cc["repo"])
+    repos = cc.get("repos") or ({"默认": cc.get("repo")} if cc.get("repo") else {})
+    if repos:
+        lines.append("- 项目仓库: %s" % "，".join("%s=%s" % (n, p) for n, p in repos.items()))
     return "\n".join(lines) + "\n\n" + content
 
 
@@ -96,7 +97,7 @@ def _with_chat_context(chat_id: str, content: str) -> str:
 # Emmy 大脑没有写文件权限，只负责【收集 + 在回复末尾吐出 <EMMY_CONFIG> 块】，
 # 真正落盘由这里的框架代码做（只写 emmy.yaml 的 chats[chat_id]，碰不到别的文件）。
 _CONFIG_RE = re.compile(r"<EMMY_CONFIG>\s*(\{.*?\})\s*</EMMY_CONFIG>", re.S)
-_ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo", "initialized")
+_ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo", "repos", "initialized")
 
 
 def _is_initialized(cc: dict) -> bool:
@@ -114,7 +115,7 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
 
 2) 是修 BUG 的话，要这两样：
    - BUG 多维表格的【分享链接】（我自己从 .../base/<app_token>?table=<table_id> 里取 token，不用谁手填）
-   - 代码项目在电脑上的【绝对路径】（已 clone 好的，如 /Users/xxx/project/xxx）
+   - 代码项目的本地【绝对路径】——可能不止一个仓（前端 / 后端），按【模块→路径】分别问清（如 前端=/Users/xxx/llm-platform-web、后端=/Users/xxx/llm-platform）；只有一个仓也行
 
 3) 拿到表链接后，自检 + 自动补全表格（用 emmy-lark，token 用从链接解析出来的）：
    - 先 `emmy-lark base +field-list --base-token <t> --table-id <tbl>` 看现有字段
@@ -130,17 +131,19 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
 
 4.5) 扫一眼群里的自动化（详见 base-automation 能力）：`emmy-lark base +workflow-list --base-token <t>` 看有没有、什么状态，简短报给群主（发现空壳/禁用的提一句）。要不要按规范建/改，先问群主、别擅自动。
 
-5) 全部 OK 后（意图确认 + 表字段/选项齐 + 置顶好 + repo 拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
-<EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repo":"/绝对/路径","initialized":true}</EMMY_CONFIG>
+5) 全部 OK 后（意图确认 + 表字段/选项齐 + 置顶好 + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
+<EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"initialized":true}</EMMY_CONFIG>
+（只有一个仓就 repos 里写一个；模块名尽量用表里「所属模块」会出现的值，worker 据此按模块路由）
 **还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
 
 对方刚说：__CONTENT__"""
     cc = config.chat_config(chat_id) or {}
-    if cc.get("base_app_token") or cc.get("repo"):
+    repos = cc.get("repos") or ({"默认": cc.get("repo")} if cc.get("repo") else {})
+    if cc.get("base_app_token") or repos:
         # 之前配过但没走完初始化：把已知的告诉 Emmy，别重新问，只补缺的 + 自检表/自动化
-        content += ("\n\n【这个群之前配过一部分，已知：base_app_token=%s, base_table_id=%s, repo=%s】"
+        content += ("\n\n【这个群之前配过一部分，已知：base_app_token=%s, base_table_id=%s, repos=%s】"
                     "——已知的直接用、别重新问；只补缺的，重点是自检补全表 schema + 扫自动化，齐了就吐带 initialized 的块。"
-                    % (cc.get("base_app_token") or "(无)", cc.get("base_table_id") or "(无)", cc.get("repo") or "(无)"))
+                    % (cc.get("base_app_token") or "(无)", cc.get("base_table_id") or "(无)", repos or "(无)"))
     return tpl.replace("__CID__", chat_id).replace("__CONTENT__", content)
 
 
