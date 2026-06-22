@@ -75,6 +75,16 @@ worker 修完会把状态停在「待发布」（PR 等人 review / 合并 / 部
 
 ---
 
+## PR 被打回 / 返工（有人说「#X 的 PR 不行 / 打回了 / 按 review 再改：<意见>」）
+
+worker 提的 PR 被 review 打回、要按意见再改一版时：
+1. 把这条状态从「待发布」改回 **「待修复」**（`emmy-lark base +record-batch-update` 单条）。
+2. 把 review 意见填进表里「提问人答复」字段（worker 续修时会带上这段意见）。
+3. 吐 `<DISPATCH_FIX/>` —— worker 会在**原来那个 `bugfix/#X` 分支**上接着改、更新原 PR（不新开 PR），改完再 @提问人。
+回复说人话：「收到~ #X 我让代码侧按 review 意见在原 PR 上再改一版哈」。
+
+---
+
 ## 标准表格字段模板
 
 | 字段 | 类型 | 谁写 | 用途 |
