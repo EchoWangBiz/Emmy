@@ -26,28 +26,29 @@ def _lark_ok(stdout: bytes) -> bool:
     return d.get("ok") is not False and d.get("code") in (0, None)
 
 
-def build_send_cmd(chat_id: str, text: str, *, idempotency_key: Optional[str] = None) -> List[str]:
-    """构造发消息命令（纯函数，便于单测）。"""
-    cmd = [
-        "lark-cli", "im", "+messages-send",
-        "--as", "bot",
-        "--chat-id", chat_id,
-        "--text", text,
-        "--format", "json",
-    ]
+def build_send_cmd(chat_id: str, text: str, *, idempotency_key: Optional[str] = None,
+                   at_user_id: Optional[str] = None) -> List[str]:
+    """构造发消息命令（纯函数，便于单测）。at_user_id：群聊多人时 @ 回的那个人，区分归属。"""
+    if at_user_id:  # 带 @：用 content 富文本（--text 不解析 <at>）
+        content = json.dumps({"text": '<at user_id="%s"></at> %s' % (at_user_id, text)}, ensure_ascii=False)
+        cmd = ["lark-cli", "im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
+               "--msg-type", "text", "--content", content, "--format", "json"]
+    else:
+        cmd = ["lark-cli", "im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
+               "--text", text, "--format", "json"]
     if idempotency_key:
         cmd += ["--idempotency-key", idempotency_key]
     return cmd
 
 
 async def send(chat_id: str, text: str, *, idempotency_key: Optional[str] = None,
-               timeout: int = 30, retries: int = 2) -> bool:
+               timeout: int = 30, retries: int = 2, at_user_id: Optional[str] = None) -> bool:
     """发一条文本到指定会话；成功返回 True。空文本直接跳过。
     带有限重试（指数退避）——网络抖动/token 短暂失效时别让用户「没下文」；
-    幂等键保证重试不重复发（调用方基本都带 event_id）。"""
+    幂等键保证重试不重复发（调用方基本都带 event_id）。at_user_id：群聊 @ 回的人。"""
     if not text or not text.strip():
         return False
-    cmd = build_send_cmd(chat_id, text, idempotency_key=idempotency_key)
+    cmd = build_send_cmd(chat_id, text, idempotency_key=idempotency_key, at_user_id=at_user_id)
     last = ""
     for attempt in range(retries + 1):
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
@@ -77,6 +78,11 @@ def _selftest() -> None:
     # 不带幂等键
     cmd2 = build_send_cmd("oc_b", "hi")
     assert "--idempotency-key" not in cmd2
+    # 带 @：走 content 富文本（--text 不解析 <at>），@ 的 open_id 进 <at>
+    cmd3 = build_send_cmd("oc_c", "修好了", at_user_id="ou_x")
+    assert "--text" not in cmd3 and "--content" in cmd3
+    payload = json.loads(cmd3[cmd3.index("--content") + 1])
+    assert payload["text"] == '<at user_id="ou_x"></at> 修好了'
     # _lark_ok：ok=false / code!=0 判失败，其余放行
     assert _lark_ok(b'{"ok":true,"data":{}}') is True
     assert _lark_ok(b'{"ok":false,"msg":"x"}') is False
