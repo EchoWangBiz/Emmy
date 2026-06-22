@@ -15,12 +15,14 @@ run.py —— Emmy 主进程
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import random
 import re
 import sys
 import time
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core import listener, claude_runner, reply, config, attachments  # noqa: E402
@@ -433,6 +435,31 @@ class ChatDispatcher:
                 q.task_done()
 
 
+# ── 单实例锁：同一时间只允许一个 Emmy 监听器在跑 ──
+# 两个监听器会【各自】连飞书长连接、每条 @消息都收两遍 → 重复回复、重复派工（worker 还会抢同一
+# worktree）。flock 排他锁能跨进程互斥；进程崩溃/退出时 fd 关闭、锁自动释放，不用手动清 PID 文件。
+_LOCK_FH = None  # 全局持有锁句柄，进程存活期间别让它被 GC 关掉（关了锁就没了）
+
+
+def _acquire_single_instance_lock(path: Optional[str] = None):
+    """拿到锁返回文件句柄（真值）；已被别的进程占用返回 None。"""
+    global _LOCK_FH
+    if path is None:
+        d = os.path.expanduser("~/.emmy")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "run.lock")
+    fh = open(path, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.write(str(os.getpid()))
+    fh.flush()
+    _LOCK_FH = fh
+    return fh
+
+
 async def main() -> None:
     system_prompt = load_system_prompt()                            # 群聊：人设 + 全部能力
     system_prompt_p2p = load_system_prompt(include_abilities=False)  # 私聊：仅人设，纯 CC 对话
@@ -457,6 +484,11 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # 单实例闸：已有监听器在跑就别再起第二个（两个会重复处理每条消息、重复派工）
+    if _acquire_single_instance_lock() is None:
+        print("⚠️ 已经有一个 Emmy 监听器在跑了（~/.emmy/run.lock 被占用），本次不启动。", flush=True)
+        print("   想重启的话：先停掉在跑的那个（launchd 用 ./start.sh stop；前台的 Ctrl-C 或 kill 掉），再起一个。", flush=True)
+        sys.exit(1)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
