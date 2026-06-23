@@ -41,15 +41,25 @@ WORKTREE_BASE = os.path.expanduser("~/.emmy/worktrees")
 
 
 # ---------------- prompt ----------------
-def build_fix_prompt(bug: dict, base_branch: str = "dev") -> str:
-    """给 worker 的 claude 的修复指引（含 git-workflow 约束 + DONE/BLOCKED 输出契约）。"""
+def build_fix_prompt(bug: dict, base_branch: str = "dev", screenshots: list = None) -> str:
+    """给 worker 的 claude 的修复指引（含 git-workflow 约束 + DONE/BLOCKED 输出契约）。
+    screenshots：BUG 截图的本地路径列表——这类前端/UI BUG 往往描述很简（一句话），截图才是问题现场，
+    所以让 claude 动手前先用 Read 看图、据图定位（实测能把"盲找半天"变成"直奔问题组件"）。"""
     extra = ("  ⚠️ 这条之前卡在「待人工确认」、提问人已补充：%s —— 按这个补充信息接着修。\n"
              % bug["答复"]) if bug.get("答复") else ""
+    shot_block = ""
+    if screenshots:
+        paths = "\n".join("     - %s" % p for p in screenshots)
+        shot_block = (
+            "📷【这条 BUG 配了截图，往往就是问题现场的画面】——文字描述可能很简，"
+            "**动手前务必先用 Read 工具逐张看这些图**，图里通常直接显示了哪儿不对/该长啥样：\n%s\n\n"
+            % paths)
     return (
         "你是代码侧的修复 agent，当前目录是一个 git worktree（基于 %s 切出的独立 bugfix 分支），"
         "你的改动不会影响别人的工作副本，放心改。\n\n"
         "要修的 BUG：\n"
         "  编号: %s\n  摘要: %s\n  详情(复现/期望/实际): %s\n%s\n"
+        "%s"  # 截图段（有截图才有）
         "⚠️【无人值守环境，务必照做】你是后台自动跑的、没有人能给你点『批准』：\n"
         "   - 任何需要审批的命令都会被【直接拦住】、把你卡死——【绝对不要】跑测试套件、构建、dev server "
         "（bun/npm/yarn run test、build、dev、start 这类），它们要么被拦、要么太慢会让你超时。\n"
@@ -68,7 +78,7 @@ def build_fix_prompt(bug: dict, base_branch: str = "dev") -> str:
         "  DONE: <PR链接> | <一句话改了啥>\n"
         "  BLOCKED: <你拿不准的具体问题>\n"
         % (base_branch, bug.get("编号", "?"), bug.get("摘要", ""), bug.get("详情", ""), extra,
-           base_branch, base_branch, base_branch)
+           shot_block, base_branch, base_branch, base_branch)
     )
 
 
@@ -288,6 +298,39 @@ def _mr_url(repo_url: str, branch: str, base: str = "dev") -> str:
     return "%s/compare/%s...%s?expand=1" % (repo_url, t, b)   # GitHub
 
 
+# ---------------- BUG 截图下载 ----------------
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+_ATTACH_BASE = os.path.expanduser("~/.emmy/bug-attachments")
+
+
+async def download_bug_attachments(base_token: str, table_id: str, record_id: str) -> list:
+    """下载这条 BUG 记录的截图附件，返回本地图片【绝对路径】列表（喂给 claude 先看图再修）。
+    lark-cli `+record-download-attachment` 的 --output 要求是 cwd 内相对路径（安全限制），
+    所以把子进程 cwd 设到目标目录、用 ./。没附件/下载失败都不致命（返回空列表，照常按文字修）。"""
+    out_dir = os.path.join(_ATTACH_BASE, record_id)
+    os.makedirs(out_dir, exist_ok=True)
+    for f in os.listdir(out_dir):  # 清上一轮残留，避免串图
+        try:
+            os.remove(os.path.join(out_dir, f))
+        except OSError:
+            pass
+    args = ["base", "+record-download-attachment", "--base-token", base_token,
+            "--table-id", table_id, "--record-id", record_id, "--output", "./", "--format", "json"]
+    try:
+        proc = await asyncio.create_subprocess_exec("lark-cli", *args, cwd=out_dir, stdout=PIPE, stderr=PIPE)
+        _out, err = await proc.communicate()
+    except Exception as e:  # noqa: BLE001
+        print("[worker] 下载附件异常: %r" % e, flush=True)
+        return []
+    if proc.returncode != 0:  # 多半是这条没附件，正常；打一行诊断就好
+        print("[worker] 附件下载未成功（可能无附件）rc=%s: %s"
+              % (proc.returncode, (err.decode("utf-8", "replace")[:120] if err else "")), flush=True)
+        return []
+    imgs = [os.path.join(out_dir, f) for f in sorted(os.listdir(out_dir))
+            if f.lower().endswith(_IMG_EXTS)]
+    return imgs
+
+
 # ---------------- 单条修复 ----------------
 async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> dict:
     bug = _field(rec.get("fields") or {})
@@ -318,7 +361,11 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
     try:
         # 领单加锁：先把状态改成"修复中"
         await write_back(base_token, table_id, rid, {STATUS_FIELD: "修复中"})
-        res = await _run_claude(build_fix_prompt(bug), cwd=wt)
+        # 下载 BUG 截图（前端/UI BUG 描述常很简，截图才是问题现场）→ 让 claude 先看图再修
+        shots = await download_bug_attachments(base_token, table_id, rid)
+        if shots:
+            print("[worker] #%s 带 %d 张截图，已下载给 claude 看：%s" % (bug["编号"], len(shots), shots), flush=True)
+        res = await _run_claude(build_fix_prompt(bug, screenshots=shots), cwd=wt)
         reply = parse_worker_reply(res.get("text", ""))
         if reply["outcome"] == "done":
             # 先确认分支真推上去了（claude 可能嘴上说 done 但没 push）
@@ -472,7 +519,13 @@ def _selftest() -> None:
     assert "0009" in p and "登录报错" in p
     assert "DONE:" in p and "BLOCKED:" in p
     assert "绝不 merge" in p and "可 review" in p and "merge request" in p  # GitLab/GitHub 通用、不自动合
-    print("✓ build_fix_prompt 含 BUG 信息 + 只到可review约束 + GitLab友好 + 输出契约")
+    assert "无人值守" in p and "不要】跑测试" in p   # 无人值守：别跑测试/构建
+    assert "📷" not in p                          # 无截图时不出现截图段
+    # 带截图：含「先看图」指令 + 路径（前端 BUG 截图就是问题现场）
+    ps = build_fix_prompt({"编号": "0024", "摘要": "x", "详情": "y"},
+                          screenshots=["/x/a.jpg", "/x/b.png"])
+    assert "📷" in ps and "Read" in ps and "/x/a.jpg" in ps and "/x/b.png" in ps
+    print("✓ build_fix_prompt 含 BUG 信息 + 无人值守约束 + 截图段(有图才出现) + 输出契约")
 
     # 2) parse_worker_reply
     assert parse_worker_reply("...\nDONE: https://x/pr/1 | 修了登录")["outcome"] == "done"
