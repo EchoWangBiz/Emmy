@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from typing import Optional
 
@@ -65,18 +66,27 @@ def build_fix_prompt(bug: dict, base_branch: str = "dev", screenshots: list = No
         "（bun/npm/yarn run test、build、dev、start 这类），它们要么被拦、要么太慢会让你超时。\n"
         "   - 验证交给 CI 和 PR review，【不是你这一步要做的】。你只管：定位 → 改最小必要的代码 → 提交 → 推分支。\n"
         "   - bash 命令尽量【单条、别套管道/复合】（`a | b`、`a && b` 里只要有一段不在白名单也会触发审批卡住）。\n\n"
+        "【第 0 步：先评估，别埋头瞎找】动手改之前，先花几分钟判断：\n"
+        "   a) 看懂这个 BUG 了吗？根因大概在哪？（结合截图 + 读【关键】文件就好，别一上来翻遍全库）\n"
+        "   b) 信息/需求够不够动手、有没有歧义？\n"
+        "   → 想清楚后，用一两句话先写出你的【根因判断 + 修复计划】，再动手。\n"
+        "   → 如果【信息不足 / 需求有歧义 / 拿不准要不要这么改】：【立刻】返回 BLOCKED 把问题问具体"
+        "（问得越具体、提问人越好一次答全）——**问一句，远胜过埋头瞎找半小时**。\n"
+        "   ⚠️ 如果你已经读了很多文件还没头绪、或在反复兜圈子，这就是『该停下来提问』的信号，别硬扛。\n\n"
+        "【绝不白干 = 沉没成本红线】你的时间有限（约 18 分钟），但【无论如何都要留下有用产出】：\n"
+        "   - 改完了 → 走下面流程提交推分支、给 DONE。\n"
+        "   - 没把握 / 快没时间 / 卡住了 → 【立刻】给 BLOCKED，并写清你已经查明的：根因在哪、可疑文件与函数、"
+        "卡在哪一步、你的修复思路。这些线索对接手的人极其有用——【绝不允许『跑了半天啥也没留下』】。\n\n"
         "请按这个流程：\n"
-        "1. 读懂相关代码、定位问题根因（用 Read/grep/find，别跑测试）。\n"
-        "2. 在【当前分支】改代码修复（已是独立 bugfix 分支）。\n"
-        "3. git add + git commit（message 写清改了啥）。\n"
-        "4. 提交后推分支：git push -u origin <当前分支>。\n"
+        "1. （第 0 步评估通过、有把握后）在【当前分支】改最小必要的代码修复。\n"
+        "2. git add + git commit（message 写清改了啥）。\n"
+        "3. 提交后推分支：git push -u origin <当前分支>。\n"
         "   - GitLab 仓库：push 输出里有一行带 merge request 的链接，把它当 PR 链接用；拿不到就写『分支已推，去开 MR』。\n"
         "   - GitHub 仓库（且有 gh）：gh pr create --base %s 提 PR。\n"
-        "   ⚠️ 绝不 merge 到 %s、绝不 push %s/main、绝不自己合 MR/PR —— 只到『可 review』就停下等人。\n"
-        "5. 遇到【拿不准/高风险/需求不清】→【不要硬改】，停下，把问题讲清楚。\n\n"
+        "   ⚠️ 绝不 merge 到 %s、绝不 push %s/main、绝不自己合 MR/PR —— 只到『可 review』就停下等人。\n\n"
         "最后一行必须是下面两种之一(便于我解析)：\n"
         "  DONE: <PR链接> | <一句话改了啥>\n"
-        "  BLOCKED: <你拿不准的具体问题>\n"
+        "  BLOCKED: <根因/可疑文件/卡点/你的思路 或 要问提问人的具体问题>\n"
         % (base_branch, bug.get("编号", "?"), bug.get("摘要", ""), bug.get("详情", ""), extra,
            shot_block, base_branch, base_branch, base_branch)
     )
@@ -243,7 +253,50 @@ async def notify_results(chat_id: str, results: list) -> None:
 
 
 # ---------------- worker claude 调用 ----------------
-async def _run_claude(prompt: str, cwd: str, timeout: int = 900) -> dict:
+def _session_dir_for(cwd: str) -> str:
+    """claude 把 cwd 转义成 ~/.claude/projects/<munged> 存 session（/ . _ 都换成 -）。"""
+    munged = re.sub(r"[/._]", "-", cwd)
+    return os.path.join(os.path.expanduser("~/.claude/projects"), munged)
+
+
+def _salvage_claude_analysis(cwd: str, max_chars: int = 500) -> str:
+    """claude 被超时强杀（没正常返回）时，从它的 session transcript 里捞出最后几段实质分析，
+    免得「跑了十几分钟啥也没留下」（沉没成本）。捞不到就返回空串。"""
+    try:
+        sdir = _session_dir_for(cwd)
+        files = [os.path.join(sdir, f) for f in os.listdir(sdir) if f.endswith(".jsonl")]
+        if not files:
+            return ""
+        latest = max(files, key=os.path.getmtime)
+        texts = []
+        with open(latest, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+                c = msg.get("content")
+                if isinstance(c, list):
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            t = str(b.get("text", "")).strip()
+                            if len(t) > 30:
+                                texts.append(t)
+    except OSError:
+        return ""
+    if not texts:
+        return ""
+    picked, total = [], 0
+    for t in reversed(texts):   # 取最后几段，拼到预算长度
+        picked.insert(0, t)
+        total += len(t)
+        if total >= max_chars:
+            break
+    return (" … ".join(picked))[:max_chars]
+
+
+async def _run_claude(prompt: str, cwd: str, timeout: int = 1080) -> dict:
     cmd = ["claude", "-p", prompt, "--output-format", "json",
            "--permission-mode", "default",
            "--allowedTools", WORKER_ALLOWED,
@@ -254,7 +307,9 @@ async def _run_claude(prompt: str, cwd: str, timeout: int = 900) -> dict:
         out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
-        return {"is_error": True, "text": "", "error": "timeout"}
+        # 超时不白干：从 session 捞 claude 最后的分析当线索交回
+        return {"is_error": True, "text": "", "error": "timeout",
+                "analysis": _salvage_claude_analysis(cwd)}
     return claude_runner.parse_result(out.decode("utf-8", "replace"))
 
 
@@ -366,6 +421,15 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
         if shots:
             print("[worker] #%s 带 %d 张截图，已下载给 claude 看：%s" % (bug["编号"], len(shots), shots), flush=True)
         res = await _run_claude(build_fix_prompt(bug, screenshots=shots), cwd=wt)
+        # 超时不白干：把 claude 临死前的分析当线索交给人，转「待人工确认」（沉没成本红线）
+        if res.get("error") == "timeout":
+            analysis = (res.get("analysis") or "").strip()
+            q = ("这条偏复杂、我在限定时间内没改完。我已经查到的线索：%s" % analysis) if analysis \
+                else "这条我在限定时间内没改完、也没留下清晰线索，麻烦人工接手看下哈。"
+            await write_back(base_token, table_id, rid,
+                             {STATUS_FIELD: "待人工确认", "待确认问题": q[:500],
+                              "AI备注": "worker 超时未完成（已尽量留下排查线索）"})
+            return {"id": bug["编号"], "result": "blocked", "q": q}
         reply = parse_worker_reply(res.get("text", ""))
         if reply["outcome"] == "done":
             # 先确认分支真推上去了（claude 可能嘴上说 done 但没 push）
@@ -525,7 +589,25 @@ def _selftest() -> None:
     ps = build_fix_prompt({"编号": "0024", "摘要": "x", "详情": "y"},
                           screenshots=["/x/a.jpg", "/x/b.png"])
     assert "📷" in ps and "Read" in ps and "/x/a.jpg" in ps and "/x/b.png" in ps
-    print("✓ build_fix_prompt 含 BUG 信息 + 无人值守约束 + 截图段(有图才出现) + 输出契约")
+    assert "第 0 步" in p and "先评估" in p          # 先评估难度
+    assert "问一句" in p and "BLOCKED" in p           # 有疑问先问、别瞎找
+    assert "沉没成本" in p and "绝不允许" in p          # 时间不够也要留分析
+    print("✓ build_fix_prompt 含 先评估/有疑问先问/沉没成本红线 + 截图段 + 输出契约")
+
+    # 1b) _salvage_claude_analysis：超时时能从 session transcript 捞出 claude 的分析
+    import tempfile
+    _wt = os.path.join(tempfile.gettempdir(), "emmy_salvage_wt", "bugfix-x")
+    _sd = _session_dir_for(_wt)
+    os.makedirs(_sd, exist_ok=True)
+    _sf = os.path.join(_sd, "s.jsonl")
+    with open(_sf, "w", encoding="utf-8") as _fh:
+        _fh.write(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "根因在 Foo.tsx 的 adaptBar，企业空间被过滤了，还差最后一步"}]}}) + "\n")
+    sav = _salvage_claude_analysis(_wt)
+    assert "Foo.tsx" in sav and "adaptBar" in sav, sav
+    assert _salvage_claude_analysis("/no/such/cwd/xyz") == ""   # 捞不到不报错
+    os.remove(_sf); os.rmdir(_sd)
+    print("✓ _salvage_claude_analysis：超时从 session 捞分析（无 session 返回空、不报错）")
 
     # 2) parse_worker_reply
     assert parse_worker_reply("...\nDONE: https://x/pr/1 | 修了登录")["outcome"] == "done"
