@@ -99,7 +99,8 @@ def _with_chat_context(chat_id: str, content: str) -> str:
 # Emmy 大脑没有写文件权限，只负责【收集 + 在回复末尾吐出 <EMMY_CONFIG> 块】，
 # 真正落盘由这里的框架代码做（只写 emmy.yaml 的 chats[chat_id]，碰不到别的文件）。
 _CONFIG_RE = re.compile(r"<EMMY_CONFIG>\s*(\{.*?\})\s*</EMMY_CONFIG>", re.S)
-_ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo", "repos", "initialized")
+_ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo", "repos",
+                 "jenkins_jobs", "initialized")
 
 
 def _is_initialized(cc: dict) -> bool:
@@ -115,9 +116,10 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
 
 1) 先确认意图：这个群想让我干啥？目前我会【修 BUG】(role=fix-bug)。不是的话就先问清楚。
 
-2) 是修 BUG 的话，要这两样：
+2) 是修 BUG 的话，要这几样：
    - BUG 多维表格的【分享链接】（我自己从 .../base/<app_token>?table=<table_id> 里取 token，不用谁手填）
    - 代码项目的本地【绝对路径】——可能不止一个仓（前端 / 后端），按【模块→路径】分别问清（如 前端=/Users/xxx/llm-platform-web、后端=/Users/xxx/llm-platform）；只有一个仓也行
+   - 【自动发布到 DEV 用】每个项目的 Jenkins job 名（按【模块→job 名】问，如 前端=llmmarket-platform-web-dev）。这步**可选**——不配就只到「待发布」、发布得人工，配了我才能在你说「发布」时自动合 DEV + 构建。
 
 3) 拿到表链接后，自检 + 自动补全表格（用 emmy-lark，token 用从链接解析出来的）：
    - 先 `emmy-lark base +field-list --base-token <t> --table-id <tbl>` 看现有字段
@@ -133,9 +135,11 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
 
 4.5) 扫一眼群里的【多维表格·工作流】（详见 base-automation 能力）：`emmy-lark base +workflow-list --base-token <t>` 看有没有，**只如实转述**（有 N 条、启没启用）。⚠️ 这只能读到「工作流(workflow)」那套，**读不到群主在「自动化中心」配的自动化**——所以别对自动化中心下「空壳 / 没触发器 / 禁用」这类结论，读不到就老实说「自动化中心我这边自检不了，你自己核对下」。要不要按规范建/改 workflow，先问群主、别擅自动。
 
+4.6) 自动发布(可选)：发布到 DEV 走 Jenkins，用 `jkit` 工具。**我自己跑不了 jkit**（权限只在 emmy-lark），所以这步靠群主：请在【跑我的这台机器】上装好 jkit 并登录一次——`jkit auth login --host <jenkins地址> --user <用户> --token <令牌>`（host/token 群主自己填，我不经手）。装好后把【每个项目的 job 名】告诉我（见第 2 步），我写进配置；以后你说「发布」我就能自动合 DEV + 构建。没装/没配也行，那就只到「待发布」、发布人工来。
+
 5) 全部 OK 后（意图确认 + 表字段/选项齐 + 群里能找到表入口[已置顶或已有文档标签页即可，没有也不强求] + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
-<EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"initialized":true}</EMMY_CONFIG>
-（只有一个仓就 repos 里写一个；模块名尽量用表里「所属模块」会出现的值，worker 据此按模块路由）
+<EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"jenkins_jobs":{"前端":"web-dev-job名","后端":"srv-dev-job名"},"initialized":true}</EMMY_CONFIG>
+（只有一个仓就 repos 里写一个；模块名尽量用表里「所属模块」会出现的值，worker 据此按模块路由；jenkins_jobs 可选、没配自动发布就省略它，模块名要和 repos 对应）
 **还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
 
 对方刚说：__CONTENT__"""
@@ -176,15 +180,23 @@ def _maybe_save_config(chat_id: str, text: str) -> tuple:
 # ── 自动派工：已配置的修 BUG 群里，Emmy 确认并标「待修复」后会在回复末尾吐 <DISPATCH_FIX/> 信号；
 #    框架接住 → 后台起 worker 改代码、提 PR、回写状态、@提问人。Emmy 自己【绝不碰代码】。──
 _DISPATCH_RE = re.compile(r"<DISPATCH_FIX\s*/?>(?:\s*</DISPATCH_FIX>)?")
-_fix_workers: dict = {}   # chat_id -> asyncio.subprocess.Process（防重起）
+# ── 自动发布：用户确认「发布到 DEV」后 Emmy 吐 <PUBLISH/> 信号 → 框架起【发布 worker】
+#    （core/publish.py，确定性、不经 claude）把「待发布」的 bugfix 合进 dev、push、jkit 构建 dev。──
+# <PUBLISH/> 全发；<PUBLISH scope="前端"/> 只发指定模块（Emmy 据用户「部署前端/后端」意图填）
+_PUBLISH_RE = re.compile(r'<PUBLISH(?:\s+scope="([^"]*)")?\s*/?>(?:\s*</PUBLISH>)?')
+_fix_workers: dict = {}      # chat_id -> (proc, logf)（防重起）
+_publish_workers: dict = {}  # chat_id -> (proc, logf)（防重起）
+# 把「查重→占位→起进程」整段按 chat_id 原子化：同群多发言人【并行】跑 handle（队列按 chat:sender 分流），
+# 几乎同时说「发布/修」会各自先过 returncode 判断都没起、再各起一个 → 重复 worker。锁按 chat_id（与登记表同维度）。
+_spawn_locks: dict = {}      # chat_id -> asyncio.Lock
 
 
 WORKER_LOG_DIR = os.path.expanduser("~/.emmy/logs")
 
 
-async def _reap_worker(chat_id: str, proc, logf) -> None:
-    """监督 worker：等它退出 → 关日志、从登记表删除（让该群能接新派工）、退出码异常则告警。
-    没有这个，proc.returncode 永远是 None，该群会被永久判定为「还在忙」、再也派不了工。"""
+async def _reap_worker(registry: dict, chat_id: str, proc, logf, label: str) -> None:
+    """监督后台 worker：等它退出 → 关日志、从登记表删除（让该群能接新活）、退出码异常则告警。
+    没有这个，proc.returncode 永远是 None，该群会被永久判定为「还在忙」、再也派不了。"""
     try:
         rc = await proc.wait()
     except Exception:  # noqa: BLE001
@@ -193,28 +205,44 @@ async def _reap_worker(chat_id: str, proc, logf) -> None:
         logf.close()
     except Exception:  # noqa: BLE001
         pass
-    if _fix_workers.get(chat_id) and _fix_workers[chat_id][0] is proc:  # 只回收自己这次的
-        _fix_workers.pop(chat_id, None)
-    tag = "✓ 跑完" if rc in (0, None) else f"⚠️ 异常退出(rc={rc})"
-    print(f"[run] worker({chat_id}) {tag}", flush=True)
+    if registry.get(chat_id) and registry[chat_id][0] is proc:  # 只回收自己这次的
+        registry.pop(chat_id, None)
+    tag = "✓ 跑完" if rc == 0 else f"⚠️ 异常退出(rc={rc})"   # None/非零都告警，别把退化场景当成功
+    print(f"[run] {label}({chat_id}) {tag}", flush=True)
+
+
+async def _spawn_worker(registry: dict, chat_id: str, script: str, log_prefix: str,
+                        emoji: str, extra: list = None) -> bool:
+    """后台起一个 worker 子进程（该群已有同类在跑就不重起）。退出由 _reap_worker 回收。
+    extra：额外命令行参数（如发布范围）。输出写 ~/.emmy/logs/<prefix>-<chat>.log，方便 tail。"""
+    if chat_id not in _spawn_locks:
+        _spawn_locks[chat_id] = asyncio.Lock()
+    async with _spawn_locks[chat_id]:   # 查重→占位→起进程 原子化，防同群多发言人并发起重复 worker
+        cur = registry.get(chat_id)
+        if cur is not None and cur[0].returncode is None:
+            return False                 # 还在跑，不重起
+        os.makedirs(WORKER_LOG_DIR, exist_ok=True)
+        log_path = os.path.join(WORKER_LOG_DIR, "%s-%s.log" % (log_prefix, chat_id))
+        logf = open(log_path, "a", buffering=1)  # 行缓冲，tail 能实时看到
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", os.path.join(PROJECT_DIR, "core", script), chat_id, *(extra or []),
+            cwd=PROJECT_DIR, stdout=logf, stderr=logf)  # -u：无缓冲，日志实时滚
+        registry[chat_id] = (proc, logf)
+        asyncio.create_task(_reap_worker(registry, chat_id, proc, logf, log_prefix))
+        print(f"[run] {emoji} 已为 {chat_id} 起 {log_prefix}（pid={proc.pid}），日志: {log_path}", flush=True)
+        return True
 
 
 async def _dispatch_fix_worker(chat_id: str) -> bool:
-    """收到派工信号 → 后台起 worker（该群已有 worker 在跑就不重起）。退出由 _reap_worker 回收。
-    输出写到 ~/.emmy/logs/worker-<chat>.log，方便 tail 观察。"""
-    cur = _fix_workers.get(chat_id)
-    if cur is not None and cur[0].returncode is None:
-        return False                 # 还在跑，不重起
-    os.makedirs(WORKER_LOG_DIR, exist_ok=True)
-    log_path = os.path.join(WORKER_LOG_DIR, "worker-%s.log" % chat_id)
-    logf = open(log_path, "a", buffering=1)  # 行缓冲，tail 能实时看到
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-u", os.path.join(PROJECT_DIR, "core", "worker.py"), chat_id,
-        cwd=PROJECT_DIR, stdout=logf, stderr=logf)  # -u：worker 无缓冲，日志实时滚（tail 看得到进度）
-    _fix_workers[chat_id] = (proc, logf)
-    asyncio.create_task(_reap_worker(chat_id, proc, logf))  # 监督回收，否则该群会卡死派不了工
-    print(f"[run] 🛠️ 已为 {chat_id} 起代码侧 worker（pid={proc.pid}），日志: {log_path}", flush=True)
-    return True
+    """收到 <DISPATCH_FIX/> → 后台起修复 worker（改码/提 PR/回写/@提问人）。"""
+    return await _spawn_worker(_fix_workers, chat_id, "worker.py", "worker", "🛠️")
+
+
+async def _dispatch_publish(chat_id: str, scope: str = "") -> bool:
+    """收到 <PUBLISH/> → 后台起发布 worker（合 dev/jkit 构建/转待验收/通知）。
+    scope：发布范围（空=全发；指定如「前端」=只发该模块）。"""
+    return await _spawn_worker(_publish_workers, chat_id, "publish.py", "publish", "🚀",
+                               extra=[scope] if scope else None)
 
 
 def _diagnose(res: dict) -> str:
@@ -276,10 +304,13 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         text = _diagnose(res)
     else:
         text = res["text"] or "（没有返回内容）"
-        # 派工信号是【内部信号、对用户不可见】——任何分支都先无条件剥离，绝不外泄给群里；
+        # 内部信号（派工 / 发布）对用户不可见——任何分支都先无条件剥离，绝不外泄；
         # 是否命中要在剥离前记下来（剥离后就搜不到了）。
-        had_signal = bool(_DISPATCH_RE.search(text))
-        text = _DISPATCH_RE.sub("", text).strip()
+        had_dispatch = bool(_DISPATCH_RE.search(text))
+        pub_m = _PUBLISH_RE.search(text)
+        had_publish = bool(pub_m)
+        publish_scope = (pub_m.group(1) or "").strip() if pub_m else ""   # 发布范围（空=全发）
+        text = _PUBLISH_RE.sub("", _DISPATCH_RE.sub("", text)).strip()
         if not inited:  # onboarding 模式：接住配置块并落盘（含 initialized 标记）
             text, just_saved = _maybe_save_config(chat_id, text)
             # 刚把修 BUG 群配好这一轮：顺手起一次 worker 扫表——onboarding 期间可能已把
@@ -291,10 +322,16 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
                 if _is_initialized(cc2) and cc2.get("role") == "fix-bug" and repos2:
                     if await _dispatch_fix_worker(chat_id):
                         text += "\n\n🛠️ 群配好啦，我顺手把表里待修的过一遍，有就开修、修好挨个通知~"
-        elif had_signal:  # 已初始化群：接住派工信号 → 后台起 worker 修代码
-            started = await _dispatch_fix_worker(chat_id)
-            text += ("\n\n🛠️ 代码侧开工啦，修好我来群里通知大家~" if started
-                     else "\n\n🛠️ 代码侧已经在忙这个群的活了，这条排上了，修好通知你~")
+        else:  # 已初始化群：接住派工 / 发布信号 → 后台起对应 worker
+            if had_dispatch:
+                started = await _dispatch_fix_worker(chat_id)
+                text += ("\n\n🛠️ 代码侧开工啦，修好我来群里通知大家~" if started
+                         else "\n\n🛠️ 代码侧已经在忙这个群的活了，这条排上了，修好通知你~")
+            if had_publish:
+                started = await _dispatch_publish(chat_id, publish_scope)
+                rng = ("「%s」" % publish_scope) if publish_scope else "待发布的"
+                text += (("\n\n🚀 收到，开始把%s合进 DEV 并构建，跑完群里通知验收~" % rng) if started
+                         else "\n\n🚀 这个群的发布已经在跑了，这次不重复触发哈~")
     await reply.send(chat_id, text, idempotency_key=msg.get("event_id"), at_user_id=at)
 
 
