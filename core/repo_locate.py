@@ -71,17 +71,23 @@ def locate(repo_path: Optional[str], expected_url: Optional[str] = None) -> Opti
 def make_worktree(repo_path: str, branch: str, worktree_dir: str, base: str = "dev") -> tuple:
     """在 repo 上开独立 worktree（不碰用户副本）。返回 (ok, msg)。
     base：从哪个分支切（默认 dev，符合 git-workflow）。
+    ⚠️【基于 origin/<base> 切，不用本地 base】：本地 base 分支可能很旧（用户没 pull），
+    而 git fetch 只更新 origin/<base>、不会移动本地分支——从本地 base 切会基于过期代码改，
+    修复对着旧码、合并时容易冲突。所以优先用刚 fetch 的 origin/<base> 作基线。
     分支已存在（二次派工/重试同一 BUG）→ 复用挂载，不再用 -b 强制新建而失败。"""
-    # 先确保 base 是最新的引用（不强制，失败不阻断）
+    # 拉最新 base，并优先以 origin/<base> 作基线（本地 base 可能落后）
     _git(["-C", repo_path, "fetch", "origin", base], timeout=60)
+    base_ref = "origin/%s" % base
+    if _git(["-C", repo_path, "rev-parse", "--verify", "--quiet", base_ref]).returncode != 0:
+        base_ref = base   # 没有 origin/<base>（纯本地仓/无远程）→ 退回本地 base
     exists = _git(["-C", repo_path, "show-ref", "--verify", "--quiet",
                    "refs/heads/%s" % branch]).returncode == 0
     if exists:
         # 已有同名 bugfix 分支：挂上去续改（保留之前的提交），不重建
         r = _git(["-C", repo_path, "worktree", "add", worktree_dir, branch])
     else:
-        r = _git(["-C", repo_path, "worktree", "add", "-b", branch, worktree_dir, base])
-        if r.returncode != 0:  # base 不存在等情况，退回从当前 HEAD 切
+        r = _git(["-C", repo_path, "worktree", "add", "-b", branch, worktree_dir, base_ref])
+        if r.returncode != 0:  # base_ref 不存在等情况，退回从当前 HEAD 切
             r = _git(["-C", repo_path, "worktree", "add", "-b", branch, worktree_dir])
     return (r.returncode == 0, (r.stderr or r.stdout).strip())
 
@@ -131,6 +137,11 @@ def _selftest() -> None:
     _git(["-C", here, "branch", "-D", "emmy_wt_selftest_br"])  # 清残留分支
     ok, msg = make_worktree(here, "emmy_wt_selftest_br", wt, base="dev")
     assert ok, "worktree add 失败: " + msg
+    # 基线应是 origin/dev（最新）而非可能过期的本地 dev——有远程才校验
+    if _git(["-C", here, "rev-parse", "--verify", "--quiet", "origin/dev"]).returncode == 0:
+        wt_head = _git(["-C", wt, "rev-parse", "HEAD"]).stdout.strip()
+        od = _git(["-C", here, "rev-parse", "origin/dev"]).stdout.strip()
+        assert wt_head == od, "新 worktree 应基于 origin/dev(%s), 实际 %s" % (od[:8], wt_head[:8])
     # 主副本 dirty 不出现在 worktree（worktree 应干净）
     st = _git(["-C", wt, "status", "--porcelain"]).stdout
     assert st.strip() == "", "新 worktree 应干净, 实际: " + st
