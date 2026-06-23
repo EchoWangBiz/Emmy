@@ -40,6 +40,16 @@ NEED_STATUS_OPTIONS = ("待修复", "修复中", "待人工确认", "待发布")
 # worker 的 worktree 一律开在【目标 repo 外】的 Emmy 自管目录，绝不在目标项目里留临时目录
 WORKTREE_BASE = os.path.expanduser("~/.emmy/worktrees")
 
+# 编号白名单：编号来自飞书表格（非受信外部输入），拼进 git 分支名/refspec 前必须过这个，
+# 只允许字母数字下划线、首字符非 '-'，挡掉 ':' '/' 空格 '-' 等——防 `bugfix/x:refs/heads/INJECTED`
+# 这类 refspec 注入（详见 emmy-dangerous-cmd-gate 备忘的「文件/表格内容→argv 间接注入」）。
+SAFE_NUM = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+
+def is_safe_num(num) -> bool:
+    """编号能否安全拼进 git 分支/refspec（只允许字母数字下划线）。纯函数。"""
+    return bool(SAFE_NUM.match(str(num or "")))
+
 
 # ---------------- prompt ----------------
 def build_fix_prompt(bug: dict, base_branch: str = "dev", screenshots: list = None) -> str:
@@ -250,6 +260,9 @@ async def notify_results(chat_id: str, results: list) -> None:
         num = _field(f)["编号"]
         asker = f.get("提问人") or f.get("报告人") or f.get("反馈人") or ""
         await _send_group(chat_id, _result_message(_at_markup(items, asker), num, r))
+    # 有修好转「待发布」的 → 提一句怎么发布（用户回「发布」即触发自动发布到 DEV）
+    if any(r.get("result") == "done" for _, r in results):
+        await _send_group(chat_id, "以上修好的都在「待发布」啦~ 要发布到 DEV 的话，跟我说一声「发布」就自动合进 DEV、构建、通知验收 🚀")
 
 
 # ---------------- worker claude 调用 ----------------
@@ -390,6 +403,13 @@ async def download_bug_attachments(base_token: str, table_id: str, record_id: st
 async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> dict:
     bug = _field(rec.get("fields") or {})
     rid = rec["record_id"]
+
+    # 编号要拿去拼 git 分支名（bugfix/<编号>），非法字符会注入 refspec → 源头挡掉
+    if not is_safe_num(bug["编号"]):
+        await write_back(base_token, table_id, rid,
+                         {STATUS_FIELD: "待人工确认",
+                          "待确认问题": "问题编号「%s」含非法字符，我不敢拿它建分支（只允许字母数字下划线），群主改下编号哈" % bug["编号"]})
+        return {"id": bug["编号"], "result": "blocked", "q": "编号非法、没法建分支"}
 
     loc = repo_locate.locate(repo_path)
     if not loc:
@@ -589,6 +609,14 @@ def _selftest() -> None:
     ps = build_fix_prompt({"编号": "0024", "摘要": "x", "详情": "y"},
                           screenshots=["/x/a.jpg", "/x/b.png"])
     assert "📷" in ps and "Read" in ps and "/x/a.jpg" in ps and "/x/b.png" in ps
+    # 编号白名单：合法编号过、注入字符挡（防 refspec 注入）
+    assert is_safe_num("0024") and is_safe_num("BUG_12") and is_safe_num("abc")
+    assert not is_safe_num("x:refs/heads/INJECTED")   # 冒号注入
+    assert not is_safe_num("../main") and not is_safe_num("a/b")   # 斜杠
+    assert not is_safe_num("a-b") and not is_safe_num("-rf")       # 横线/像选项
+    assert not is_safe_num("") and not is_safe_num("?") and not is_safe_num("a b")
+    print("✓ is_safe_num 编号白名单（挡 refspec 注入 : / - 空格 等）")
+
     assert "第 0 步" in p and "先评估" in p          # 先评估难度
     assert "问一句" in p and "BLOCKED" in p           # 有疑问先问、别瞎找
     assert "沉没成本" in p and "绝不允许" in p          # 时间不够也要留分析
