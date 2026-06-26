@@ -205,8 +205,9 @@ def _attachment_note(img_paths: List[str]) -> str:
             "你给每条 bug 建好记录、拿到 record_id 后，把对应截图传进表的「附件/截图」列"
             "（这样代码侧 worker 修的时候才看得到现场，别只把 token 写进 AI备注）：\n"
             "  emmy-lark base +record-upload-attachment --base-token <t> --table-id <tbl> "
-            "--record-id <rid> --field-id 附件/截图 --file <上面对应的本地路径>\n"
-            "  （同一条 bug 多张图就重复 --file；只能传我下到 ~/.emmy/ 下的这些文件。）")
+            "--record-id <rid> --field-id <「附件/截图」字段的真实id> --file <上面对应的本地路径>\n"
+            "  （⚠️ --field-id 要用 field-list 查到的字段 id（形如 fld…），别填中文名「附件/截图」——"
+            "名字里带「/」会 404；同一条多张图就重复 --file；只能传我下到 ~/.emmy/ 下的这些文件。）")
 
 
 def _wrap_forwarded(text: str, budget: int) -> str:

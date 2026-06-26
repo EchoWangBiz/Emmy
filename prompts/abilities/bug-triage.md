@@ -39,10 +39,10 @@
    > 注：`record-upsert` / `batch-create` 的 `--json` 里【写不了附件字段】，截图要建好记录后单独传（下一步）。
 4. **有截图就传进「附件/截图」列**（代码侧 worker 是从这列读现场的，只写进 AI备注 它看不到、会盲修）：
    - **截图我已自动下载好**——不管是对方直接发的（post/图片消息）还是转发的会话记录：注入内容里会有「对方消息里的截图，我已经帮你下载到本地了」+ 每张图的本地路径（文件名去掉扩展名 = 正文里 `[Image: <token>]` 的 token，按它对上是哪条 bug）。
-   - 建好记录拿到 `record_id` 后，把对应截图传上去：
+   - 建好记录拿到 `record_id` 后，把对应截图传上去（`--field-id` 用 `field-list` 查到的**字段 id**（形如 `fld…`），**别填中文名「附件/截图」**——名字带「/」会 404）：
      ```
      emmy-lark base +record-upload-attachment --base-token <t> --table-id <tbl> \
-       --record-id <rid> --field-id 附件/截图 --file <上面给的本地路径>
+       --record-id <rid> --field-id <「附件/截图」字段id> --file <上面给的本地路径>
      ```
      （同一条多张图就重复 `--file`；只能传 `~/.emmy/` 下我下好的文件，别的路径门禁会拦。）
    - 不是转发、没有本地图（对方只在群里口头描述）→ 在「AI备注」注明「截图见群消息」，或请提问人手动拖进那条记录。
@@ -172,9 +172,9 @@ emmy-lark base +record-upsert --base-token <t> --table-id <tbl> \
 emmy-lark base +record-batch-create --base-token <t> --table-id <tbl> \
   --json '{"fields":["问题编号","问题摘要","状态"],"rows":[["#0026","菜单栏高度异常","待处理"]]}'
 
-# 传截图进「附件/截图」列（转发记录的图我已下到 ~/.emmy/ 下；建好记录拿 record_id 后传）
+# 传截图进「附件/截图」列（图我已下到 ~/.emmy/ 下；--field-id 用 field-list 查的真实 id（fld…），别用中文名会 404）
 emmy-lark base +record-upload-attachment --base-token <t> --table-id <tbl> \
-  --record-id <rid> --field-id 附件/截图 --file ~/.emmy/fwd-attachments/<msgid>/lark-im-resources/<token>.jpg
+  --record-id <rid> --field-id <附件字段id> --file ~/.emmy/.../lark-im-resources/<token>.jpg
 
 # 改状态（注意：patch 会应用到 record_id_list 里的所有记录！）
 emmy-lark base +record-batch-update --base-token <t> --table-id <tbl> \
