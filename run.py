@@ -133,9 +133,7 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
    发 → `emmy-lark im +messages-send --as bot --chat-id __CID__ --msg-type text --content '{"text":"📊 BUG 表在这儿：<表链接>"}'`（记下返回的 message_id）
    pin → `emmy-lark im pins create --chat-id __CID__ --message-id <上一步的 message_id>`
 
-4.5) 扫一眼群里的【多维表格·工作流】（详见 base-automation 能力）：`emmy-lark base +workflow-list --base-token <t>` 看有没有，**只如实转述**（有 N 条、启没启用）。⚠️ 这只能读到「工作流(workflow)」那套，**读不到群主在「自动化中心」配的自动化**——所以别对自动化中心下「空壳 / 没触发器 / 禁用」这类结论，读不到就老实说「自动化中心我这边自检不了，你自己核对下」。要不要按规范建/改 workflow，先问群主、别擅自动。
-
-4.6) 自动发布(可选)：发布到 DEV 走 Jenkins，用 `jkit` 工具。**我自己跑不了 jkit**（权限只在 emmy-lark），所以这步靠群主：请在【跑我的这台机器】上装好 jkit 并登录一次——`jkit auth login --host <jenkins地址> --user <用户> --token <令牌>`（host/token 群主自己填，我不经手）。装好后把【每个项目的 job 名】告诉我（见第 2 步），我写进配置；以后你说「发布」我就能自动合 DEV + 构建。没装/没配也行，那就只到「待发布」、发布人工来。
+4.5) 自动发布(可选)：发布到 DEV 走 Jenkins，用 `jkit` 工具。**我自己跑不了 jkit**（权限只在 emmy-lark），所以这步靠群主：请在【跑我的这台机器】上装好 jkit 并登录一次——`jkit auth login --host <jenkins地址> --user <用户> --token <令牌>`（host/token 群主自己填，我不经手）。装好后把【每个项目的 job 名】告诉我（见第 2 步），我写进配置；以后你说「发布」我就能自动合 DEV + 构建。没装/没配也行，那就只到「待发布」、发布人工来。
 
 5) 全部 OK 后（意图确认 + 表字段/选项齐 + 群里能找到表入口[已置顶或已有文档标签页即可，没有也不强求] + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
 <EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"jenkins_jobs":{"前端":"web-dev-job名","后端":"srv-dev-job名"},"initialized":true}</EMMY_CONFIG>
@@ -146,9 +144,9 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
     cc = config.chat_config(chat_id) or {}
     repos = cc.get("repos") or ({"默认": cc.get("repo")} if cc.get("repo") else {})
     if cc.get("base_app_token") or repos:
-        # 之前配过但没走完初始化：把已知的告诉 Emmy，别重新问，只补缺的 + 自检表/自动化
+        # 之前配过但没走完初始化：把已知的告诉 Emmy，别重新问，只补缺的 + 自检表 schema
         content += ("\n\n【这个群之前配过一部分，已知：base_app_token=%s, base_table_id=%s, repos=%s】"
-                    "——已知的直接用、别重新问；只补缺的，重点是自检补全表 schema + 扫自动化，齐了就吐带 initialized 的块。"
+                    "——已知的直接用、别重新问；只补缺的，重点是自检补全表 schema，齐了就吐带 initialized 的块。"
                     % (cc.get("base_app_token") or "(无)", cc.get("base_table_id") or "(无)", repos or "(无)"))
     return tpl.replace("__CID__", chat_id).replace("__CONTENT__", content)
 
