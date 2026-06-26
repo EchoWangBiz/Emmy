@@ -260,6 +260,7 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     content = (msg.get("content") or "").strip()
     file_ids = msg.get("file_message_ids") or []
     fwd_ids = msg.get("forward_message_ids") or []
+    reply_ids = msg.get("reply_src_ids") or []
     is_p2p = msg.get("chat_type") == "p2p"
     cc = None if is_p2p else config.chat_config(chat_id)
     at = None if is_p2p else (sender_id or None)   # 群聊回复 @ 回发言人（区分这话是冲谁说的）；私聊不 @
@@ -280,6 +281,11 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         fwd_text = await attachments.gather_forwarded(fwd_ids)
         if fwd_text:
             content = (content + "\n\n" + fwd_text).strip()
+    # 回复上下文：若这条是「回复」别人某条消息，补上被回复的原消息（让 Emmy 看懂指代）
+    if reply_ids and (is_p2p or cc is not None):
+        reply_text = await attachments.gather_reply_context(reply_ids)
+        if reply_text:
+            content = (content + "\n\n" + reply_text).strip()
 
     # 读完文件仍没有任何可用内容（图片/读不了的文件且无文字）→ 温和提示
     if not content:
@@ -369,6 +375,8 @@ def _merge_msgs(msgs: list) -> dict:
     base["forward_message_ids"] = [
         m["message_id"] for m in msgs
         if m.get("message_type") == "merge_forward" and m.get("message_id")]
+    # 本批所有消息 id —— 框架据此 mget 发现「回复」关系，补齐被回复的原消息（事件不带 reply_to）
+    base["reply_src_ids"] = [m["message_id"] for m in msgs if m.get("message_id")]
     return base
 
 
