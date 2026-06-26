@@ -39,6 +39,8 @@ MAX_FILE_BYTES = 512 * 1024     # 单文件读取字节上限
 MAX_INJECT_CHARS = 16000        # 单文件注入字符上限
 MAX_TOTAL_INJECT = 40000        # 一批所有文件注入字符总上限（防撑爆 prompt/argv）
 DOWNLOAD_TIMEOUT = 30           # 单条消息下载超时（秒）
+_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")   # 截图类，留存供 Emmy 上传进附件列
+_STAGING = os.path.expanduser("~/.emmy/msg-attachments")         # 直接消息附件暂存（图留存、文本读完即删）
 
 _REPLACEMENT_CHAR = "�"    # open(errors="replace") 对非法字节产生的替换符
 # 要剥除的码点（保留换行 0x0a、制表 0x09）：C0/C1 控制符 + BiDi 覆盖/隔离类，防视觉欺骗式注入
@@ -107,38 +109,47 @@ def _read_block(path: str, budget: int) -> Optional[str]:
 async def gather(message_ids: List[str],
                  downloader: Callable[[str, str], Awaitable[Tuple[Optional[int], str]]] = _default_download
                  ) -> str:
-    """逐条消息下载其文件、读文本、拼成带不可信边界的可注入块；每条独立临时目录、用后即删。
-    任何失败都安全降级（跳过该条 / 返回已读到的）。"""
+    """逐条消息下载其资源：文本读出注入（读完即删、不留残留）、截图留存到 ~/.emmy 并给上传指引。
+    每条独立暂存目录（图要留着给 Emmy 传进「附件/截图」列）。任何失败都安全降级（跳过该条 / 返回已读到的）。"""
     ids = [m for m in (message_ids or []) if m]
     if not ids:
         return ""
     blocks: List[str] = []
+    img_paths: List[str] = []
     used = 0
     for mid in ids:
         if used >= MAX_TOTAL_INJECT:
             blocks.append("…（还有文件没贴，内容太多了，先看这些~）")
             break
-        workdir = tempfile.mkdtemp(prefix="emmy_att_")
+        workdir = os.path.join(_STAGING, mid)
+        shutil.rmtree(workdir, ignore_errors=True)        # 清上一轮，避免串内容
+        os.makedirs(workdir, exist_ok=True)
         try:
-            try:
-                rc, err = await downloader(mid, workdir)
-            except Exception as e:  # noqa: BLE001
-                print(f"[attachments] {mid} 下载异常: {e}", flush=True)
+            rc, err = await downloader(mid, workdir)
+        except Exception as e:  # noqa: BLE001
+            print(f"[attachments] {mid} 下载异常: {e}", flush=True)
+            continue
+        if rc is None:
+            print(f"[attachments] {mid} 下载超时，跳过（不注入半成品）", flush=True)
+            continue
+        files = _scan_files(os.path.join(workdir, _RES_SUBDIR))
+        if not files:
+            print(f"[attachments] {mid} 没下到文件 rc={rc} err={(err or '')[:200]}", flush=True)
+            continue
+        for f in files:
+            if os.path.splitext(f)[1].lower() in _IMG_EXTS:
+                img_paths.append(f)                       # 截图：留存待上传，不读不删
                 continue
-            if rc is None:
-                print(f"[attachments] {mid} 下载超时，跳过（不注入半成品）", flush=True)
-                continue
-            files = _scan_files(os.path.join(workdir, _RES_SUBDIR))
-            if not files:
-                print(f"[attachments] {mid} 没下到文件 rc={rc} err={(err or '')[:200]}", flush=True)
-                continue
-            for f in files:
-                block = _read_block(f, MAX_TOTAL_INJECT - used)
-                if block:
-                    blocks.append(block)
-                    used += len(block)
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+            block = _read_block(f, MAX_TOTAL_INJECT - used)
+            if block:
+                blocks.append(block)
+                used += len(block)
+            try:                                          # 非图文件读完即删，不留残留
+                os.remove(f)
+            except OSError:
+                pass
+    if img_paths:                                         # 截图给本地路径 + 上传指引（边界块之外，框架可信指引）
+        blocks.append(_attachment_note(img_paths))
     return "\n\n".join(blocks)
 
 
@@ -151,7 +162,6 @@ async def gather(message_ids: List[str],
 #   转发内容同属「非受信外部输入」，照样剥控制字符 + nonce 边界 + 注入预算。
 # ======================================================================
 _FWD_STAGING = os.path.expanduser("~/.emmy/fwd-attachments")   # 转发截图的持久暂存根目录
-_IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 
 
 async def _default_fetch_forwarded(message_id: str, timeout: int = DOWNLOAD_TIMEOUT):
@@ -189,7 +199,7 @@ async def _default_fetch_forwarded(message_id: str, timeout: int = DOWNLOAD_TIME
 def _attachment_note(img_paths: List[str]) -> str:
     """框架可信指引（放在不可信边界块【之外】）：给 Emmy 截图本地路径 + 怎么传进附件列。"""
     lines = "\n".join(f"  - {os.path.basename(p)}  →  {p}" for p in img_paths)
-    return ("【这条转发里的截图，我已经帮你下载到本地了】文件名（去掉扩展名）就是上面转发文本里 "
+    return ("【对方消息里的截图，我已经帮你下载到本地了】文件名（去掉扩展名）就是消息正文里 "
             "[Image: <token>] 的 token，按它对上是哪条 bug 的图：\n"
             f"{lines}\n"
             "你给每条 bug 建好记录、拿到 record_id 后，把对应截图传进表的「附件/截图」列"
@@ -276,24 +286,28 @@ def _selftest() -> None:
     finally:
         shutil.rmtree(d)
 
-    # 2) gather：fake downloader 造文件 → 逐条独立目录 + 读内容 + 用后即删
-    created = []
+    # 2) gather：文本读完即删 + 截图留存并给上传指引 + 空 ids 安全
     async def fake_dl(mid, workdir, **kw):
-        created.append(workdir)
         rd = os.path.join(workdir, _RES_SUBDIR)
         os.makedirs(rd, exist_ok=True)
         with open(os.path.join(rd, f"{mid}.sql"), "w") as f:
             f.write(f"-- {mid}\nSELECT 1;")
+        with open(os.path.join(rd, f"{mid}.jpg"), "wb") as f:   # 截图
+            f.write(b"\xff\xd8\xffjpgdata")
         return 0, ""
 
     async def run_gather():
-        out = await gather(["om1", "om2"], downloader=fake_dl)
-        assert "om1.sql" in out and "om2.sql" in out, out
-        assert len(created) == 2 and all(not os.path.exists(w) for w in created), "每条独立目录且用后即删"
+        out = await gather(["om1"], downloader=fake_dl)
+        assert "om1.sql" in out and "SELECT 1;" in out, out                  # 文本注入
+        assert "record-upload-attachment" in out and "om1.jpg" in out, out   # 截图给上传指引
+        rd = os.path.join(_STAGING, "om1", _RES_SUBDIR)
+        assert not os.path.exists(os.path.join(rd, "om1.sql")), "文本读完应删，不留残留"
+        assert os.path.exists(os.path.join(rd, "om1.jpg")), "截图应留存待上传"
         assert await gather([], downloader=fake_dl) == "", "空 ids 返回空"
+        shutil.rmtree(os.path.join(_STAGING, "om1"), ignore_errors=True)     # 清测试残留
         return True
     assert asyncio.run(run_gather())
-    print("✓ gather：逐条独立临时目录 + 读内容 + 用后即删 + 空 ids 安全")
+    print("✓ gather：文本读完即删 + 截图留存并给上传指引 + 空 ids 安全")
 
     # 3) gather：超时 → 跳过、不注入半成品
     async def fake_timeout(mid, workdir, **kw):
