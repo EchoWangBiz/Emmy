@@ -20,7 +20,10 @@ import json
 from typing import List, Tuple
 
 BATCH_LIMIT = 20                       # record 批量写超过这个条数即拦
-_RECORD_LIST_KEYS = ("record_id_list", "records", "record_ids", "records_list")
+# 批量写载荷里「条数」可能出现的 key：
+#   record-batch-update → record_id_list（被 patch 的记录）
+#   record-batch-create → rows（每行一条新记录，跟 fields 顺序）
+_RECORD_LIST_KEYS = ("record_id_list", "records", "record_ids", "records_list", "rows")
 
 # 只放行这些命令前缀（按位置参数小写匹配）。Emmy 当前能力 = BUG 管理（base 多维表格 + im 消息）。
 # 新增能力请在此显式添加；危险操作（删除/清空/覆盖/转移/移动/撤销/api 写/未知子命令）一律落在白名单外。
@@ -29,7 +32,9 @@ _ALLOWED_PREFIXES = (
     "base +record-list", "base +record-search", "base +record-get",
     "base +field-list", "base +table-list", "base +view-list",
     # —— base 多维表格：受控写（建/改记录、建字段；批量写另受阈值约束）——
-    "base +record-create", "base +record-update", "base +record-upsert",
+    # 注：lark-cli 无单条 record-create/record-update 命令；建记录走 batch-create（按 rows）
+    #     或 upsert（不带 --record-id 即建单条）。
+    "base +record-batch-create", "base +record-upsert",
     "base +record-batch-update", "base +field-create",
     # —— im 消息：读 ——
     "im chat.members get", "im +messages-mget", "im +messages-resources-download",
@@ -47,7 +52,8 @@ _ALLOWED_PREFIXES = (
     # —— 读 lark-cli 自带文档（建自动化前学 steps 格式，只读）——
     "skills read",
 )
-_BATCH_WRITE_PREFIX = "base +record-batch-update"   # 白名单内但需 fail-closed 阈值核验
+# 白名单内但需 fail-closed 阈值核验的批量写（建/改记录，超阈值或算不出条数都拦）
+_BATCH_WRITE_PREFIXES = ("base +record-batch-update", "base +record-batch-create")
 
 
 def _count_records(argv: List[str]):
@@ -89,7 +95,7 @@ def classify(argv: List[str]) -> Tuple[bool, str]:
         return True, f"{shown} —— 不在安全白名单内（默认拒绝；如确需，请人工执行或显式加白名单）"
 
     # 批量写：fail-closed —— 算不出条数（无 --json / @file / stdin / 脏 JSON）或超阈值都拦
-    if cmd_prefix == _BATCH_WRITE_PREFIX or cmd_prefix.startswith(_BATCH_WRITE_PREFIX + " "):
+    if any(cmd_prefix == p or cmd_prefix.startswith(p + " ") for p in _BATCH_WRITE_PREFIXES):
         n = _count_records(a)
         if n is None:
             return True, "批量写但无法静态核验条数（载荷缺失/来自文件或 stdin）——保险起见拦截"
@@ -121,7 +127,12 @@ def _selftest() -> None:
     assert not blocked(["skills", "read", "lark-base-workflow-guide"])
     assert not blocked(["base", "+record-batch-update", "--base-token", "t", "--table-id", "tb",
                         "--json", '{"record_id_list":["rec1"],"patch":{"状态":"待修复"}}'])
-    print("✓ 放行：base/im/contact 白名单内读写 + 单条批量改 + --help")
+    # 登记新 BUG：小批量建记录放行（rows ≤ 阈值）
+    assert not blocked(["base", "+record-batch-create", "--base-token", "t", "--table-id", "tb",
+                        "--json", '{"fields":["问题摘要","状态"],"rows":[["菜单栏高度异常","待修复"]]}'])
+    assert not blocked(["base", "+record-upsert", "--base-token", "t", "--table-id", "tb",
+                        "--json", '{"问题摘要":"菜单栏高度异常","状态":"待修复"}'])   # 不带 record-id = 建单条
+    print("✓ 放行：base/im/contact 白名单内读写 + 单条批量改 + 小批量建记录/upsert + --help")
 
     # —— 不误杀（红队 false-positive 全消）：白名单内、关键词在 flag/数据值里 ——
     assert not blocked(["im", "+messages-send", "--as", "bot", "--chat-id", "oc_x",
@@ -138,7 +149,7 @@ def _selftest() -> None:
     assert blocked(["sheets", "+cells-clear", "--url", "u", "--range", "A1:Z99999", "--scope", "all"])
     assert blocked(["sheets", "+cells-replace", "--url", "u", "--find", ".*", "--regex", "--replacement", ""])
     assert blocked(["docs", "+update", "--doc", "doxX", "--command", "overwrite", "--content", ""])
-    assert blocked(["base", "+record-batch-create", "--base-token", "t", "--json", '{"rows":[[1],[2]]}'])
+    assert blocked(["base", "+record-delete", "--base-token", "t", "--record-id", "rec_x"])  # 删记录
     assert blocked(["base", "+field-update", "--base-token", "t", "--field-id", "f"])  # 改字段类型 high-risk
     assert blocked(["base", "+table-delete", "--base-token", "t"])
     assert blocked(["wiki", "+move", "--node-token", "n"])
@@ -146,14 +157,18 @@ def _selftest() -> None:
     assert blocked(["drive", "+version-revert", "--file-token", "f"])
     assert blocked(["api", "POST", "/open-apis/bitable/v1/.../batch_update"])          # api 写
     assert blocked(["api", "GET", "/open-apis/im/v1/chats"])                           # api 一律不放（含读）
-    print("✓ 拦截：transfer_owner/cells-clear/cells-replace/docs-overwrite/batch-create/field-update/delete/move/cancel/revert/api")
+    print("✓ 拦截：transfer_owner/cells-clear/cells-replace/docs-overwrite/record-delete/field-update/table-delete/move/cancel/revert/api")
 
     # —— 批量写 fail-closed（红队 #5/#6）——
     big = '{"record_id_list":[%s]}' % ",".join('"r%d"' % i for i in range(25))
-    assert blocked(["base", "+record-batch-update", "--base-token", "t", "--json", big])      # 超阈值
+    assert blocked(["base", "+record-batch-update", "--base-token", "t", "--json", big])      # 改：超阈值
     assert blocked(["base", "+record-batch-update", "--base-token", "t", "--json", "@payload.json"])  # @file 无法核验
     assert blocked(["base", "+record-batch-update", "--base-token", "t"])                     # 无 --json
-    print("✓ 批量写 fail-closed：超阈值 / @file / 缺载荷 都拦，只放明确小批量")
+    big_rows = '{"fields":["A"],"rows":[%s]}' % ",".join('["v%d"]' % i for i in range(25))
+    assert blocked(["base", "+record-batch-create", "--base-token", "t", "--json", big_rows]) # 建：超阈值
+    assert blocked(["base", "+record-batch-create", "--base-token", "t", "--json", "@rows.json"])  # @file 无法核验
+    assert blocked(["base", "+record-batch-create", "--base-token", "t"])                     # 无 --json
+    print("✓ 批量写 fail-closed：建/改 超阈值 / @file / 缺载荷 都拦，只放明确小批量")
 
     # —— 边界 ——
     assert not blocked([])
