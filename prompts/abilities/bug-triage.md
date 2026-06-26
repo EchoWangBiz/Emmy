@@ -36,9 +36,18 @@
    emmy-lark base +record-upsert --base-token <t> --table-id <tbl> \
      --json '{"问题编号":"#0026","问题摘要":"管理后台左侧菜单栏高度异常，与 logo 重叠","复现/期望/实际":"...","类型":"样式","状态":"待处理","提问人":"齐凯"}'
    ```
-   > ⚠️ **截图/附件 batch-create / upsert 写不进去**（lark-cli 不支持直接写附件字段）——文本字段先登记好，截图让提问人手动拖进那条记录，或在「AI备注」里注明「截图见群消息」。
-4. **默认建成「待处理」**。若对方同时说「记下来顺便修了」→ 建成「待修复」并接着走下面的派工（吐 `<DISPATCH_FIX/>`）。
-5. 回复说人话：「记好啦~ 已登记 #0026『菜单栏高度异常』，状态待处理，要修吱一声我派给代码侧~」。
+   > 注：`record-upsert` / `batch-create` 的 `--json` 里【写不了附件字段】，截图要建好记录后单独传（下一步）。
+4. **有截图就传进「附件/截图」列**（尤其转发的会话记录——代码侧 worker 是从这列读现场的，只写进 AI备注 它看不到、会盲修）：
+   - **转发记录里的截图我已自动下载好**：注入内容里会有「这条转发里的截图已下载到本地」+ 每张图的本地路径（文件名去掉扩展名 = 转发文本里 `[Image: <token>]` 的 token，按它对上是哪条 bug）。
+   - 建好记录拿到 `record_id` 后，把对应截图传上去：
+     ```
+     emmy-lark base +record-upload-attachment --base-token <t> --table-id <tbl> \
+       --record-id <rid> --field-id 附件/截图 --file <上面给的本地路径>
+     ```
+     （同一条多张图就重复 `--file`；只能传 `~/.emmy/` 下我下好的文件，别的路径门禁会拦。）
+   - 不是转发、没有本地图（对方只在群里口头描述）→ 在「AI备注」注明「截图见群消息」，或请提问人手动拖进那条记录。
+5. **默认建成「待处理」**。若对方同时说「记下来顺便修了」→ 建成「待修复」并接着走下面的派工（吐 `<DISPATCH_FIX/>`）。
+6. 回复说人话：「记好啦~ 已登记 #0026『菜单栏高度异常』（截图也传上了），状态待处理，要修吱一声我派给代码侧~」。
 
 ---
 
@@ -162,6 +171,10 @@ emmy-lark base +record-upsert --base-token <t> --table-id <tbl> \
 # 登记多条（fields 是列顺序、rows 跟着排；一次最多 20 条）
 emmy-lark base +record-batch-create --base-token <t> --table-id <tbl> \
   --json '{"fields":["问题编号","问题摘要","状态"],"rows":[["#0026","菜单栏高度异常","待处理"]]}'
+
+# 传截图进「附件/截图」列（转发记录的图我已下到 ~/.emmy/ 下；建好记录拿 record_id 后传）
+emmy-lark base +record-upload-attachment --base-token <t> --table-id <tbl> \
+  --record-id <rid> --field-id 附件/截图 --file ~/.emmy/fwd-attachments/<msgid>/lark-im-resources/<token>.jpg
 
 # 改状态（注意：patch 会应用到 record_id_list 里的所有记录！）
 emmy-lark base +record-batch-update --base-token <t> --table-id <tbl> \

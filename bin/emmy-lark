@@ -14,6 +14,26 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 from core.lark_gate import classify  # noqa: E402
 
+
+def _rewrite_upload_for_cwd(argv):
+    """lark-cli 的 record-upload-attachment 要求 --file 是【cwd 内相对路径】（拒绝绝对路径），
+    而门禁要求 Emmy 传【~/.emmy 下的绝对路径】才能校验安全——两者冲突。
+    放行后在这里翻译：chdir 到文件所在目录、把 --file 改成相对名，满足 lark-cli。
+    门禁已在 classify 阶段用【原始绝对路径】校验过安全，故此翻译不削弱门禁。
+    返回 (chdir_to or None, new_argv)。非 upload / 无 --file → (None, argv 原样)。"""
+    pos = [t for t in argv if not t.startswith("-")]
+    if " ".join(pos[:2]).lower() != "base +record-upload-attachment":
+        return None, argv
+    file_idxs = [i + 1 for i, t in enumerate(argv) if t == "--file" and i + 1 < len(argv)]
+    if not file_idxs:
+        return None, argv
+    base_dir = os.path.dirname(os.path.abspath(argv[file_idxs[0]]))
+    new = list(argv)
+    for i in file_idxs:
+        new[i] = os.path.join(".", os.path.relpath(os.path.abspath(argv[i]), base_dir))
+    return base_dir, new
+
+
 blocked, reason = classify(sys.argv[1:])
 if blocked:
     sys.stderr.write(json.dumps({
@@ -24,9 +44,16 @@ if blocked:
     }, ensure_ascii=False) + "\n")
     sys.exit(13)
 
-# 放行：透传给真正的 lark-cli（execvp 走 PATH 找 lark-cli，不会回到本包装）
+# 放行：上传命令先把绝对 --file 翻译成 cwd 相对（满足 lark-cli），再透传给真正的 lark-cli
+chdir_to, argv2 = _rewrite_upload_for_cwd(sys.argv[1:])
+if chdir_to:
+    try:
+        os.chdir(chdir_to)
+    except OSError as e:
+        sys.stderr.write("emmy-lark: 无法进入附件目录 %s: %s\n" % (chdir_to, e))
+        sys.exit(1)
 try:
-    os.execvp("lark-cli", ["lark-cli"] + sys.argv[1:])
+    os.execvp("lark-cli", ["lark-cli"] + argv2)
 except FileNotFoundError:
     sys.stderr.write("emmy-lark: 找不到 lark-cli，请确认已安装 @larksuite/cli\n")
     sys.exit(127)
