@@ -82,7 +82,8 @@
 | 读表记录 | `emmy-lark base +record-list --base-token <t> --table-id <tbl>` |
 | 看表字段 | `emmy-lark base +field-list --base-token <t> --table-id <tbl>` |
 | 改状态（小批量） | `emmy-lark base +record-batch-update --base-token <t> --table-id <tbl> --json '{"record_id_list":["rec_x"],"patch":{"状态":"待修复"}}'` |
-| 登记新记录（单条） | `emmy-lark base +record-upsert --base-token <t> --table-id <tbl> --json '{"问题摘要":"...","状态":"待处理"}'`（不带 --record-id 即新建；附件写不了） |
+| 登记新记录（单条） | `emmy-lark base +record-upsert --base-token <t> --table-id <tbl> --json '{"问题摘要":"...","状态":"待处理"}'`（不带 --record-id 即新建；附件单独传，见下行） |
+| 传截图进附件列 | `emmy-lark base +record-upload-attachment --base-token <t> --table-id <tbl> --record-id <rid> --field-id 附件/截图 --file ~/.emmy/fwd-attachments/<msgid>/lark-im-resources/<token>.jpg`（转发的图我已下好；只能传 ~/.emmy/ 下的） |
 | 建字段 | `emmy-lark base +field-create --base-token <t> --table-id <tbl> --json '{...}'` |
 
 > 命令默认输出 JSON，方便你看结果。拿不准就 `--help`，小机灵鬼最爱查说明书啦~
