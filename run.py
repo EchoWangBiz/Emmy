@@ -259,22 +259,27 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     sender_id = msg.get("sender_id") or ""
     content = (msg.get("content") or "").strip()
     file_ids = msg.get("file_message_ids") or []
+    fwd_ids = msg.get("forward_message_ids") or []
     is_p2p = msg.get("chat_type") == "p2p"
     cc = None if is_p2p else config.chat_config(chat_id)
     at = None if is_p2p else (sender_id or None)   # 群聊回复 @ 回发言人（区分这话是冲谁说的）；私聊不 @
 
-    # 纯空消息（既没文字又没文件）→ 温和提示，不 ack、不调 claude
-    if not content and not file_ids:
+    # 纯空消息（既没文字、又没文件、也没转发记录）→ 温和提示，不 ack、不调 claude
+    if not content and not file_ids and not fwd_ids:
         await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"), at_user_id=at)
         return
 
     # 注：群聊的「队列播报」第一段由 ChatDispatcher.submit 在入队时已发（私聊不播报），这里直接干活。
 
-    # 文件内容注入：仅【私聊】或【已配置群】才读；门禁未配置阶段不注入（免得大段文件污染配置收集）
+    # 文件 / 转发记录内容注入：仅【私聊】或【已配置群】才读；门禁未配置阶段不注入（免得大段内容污染配置收集）
     if file_ids and (is_p2p or cc is not None):
         file_text = await attachments.gather(file_ids)
         if file_text:
             content = (content + "\n\n" + file_text).strip()
+    if fwd_ids and (is_p2p or cc is not None):
+        fwd_text = await attachments.gather_forwarded(fwd_ids)
+        if fwd_text:
+            content = (content + "\n\n" + fwd_text).strip()
 
     # 读完文件仍没有任何可用内容（图片/读不了的文件且无文字）→ 温和提示
     if not content:
@@ -351,12 +356,19 @@ def _merge_msgs(msgs: list) -> dict:
     """同一 chat 的多条消息合并成一条：内容按行拼接，回复挂最后一条，幂等键用第一条。
     同时收集文件类消息的 message_id —— 框架据此下载并读出文本内容注入给 Emmy。"""
     base = dict(msgs[-1])
+    # merge_forward（飞书「会话记录」卡片）的原始 content 只是占位、不可读 → 不进拼接，
+    # 改由 forward_message_ids 用 messages-mget 展开成全文（见 attachments.gather_forwarded）。
     base["content"] = "\n".join(
-        c for c in ((m.get("content") or "").strip() for m in msgs) if c)
+        c for m in msgs
+        for c in ((m.get("content") or "").strip(),)
+        if c and m.get("message_type") != "merge_forward")
     base["event_id"] = msgs[0].get("event_id", "")
     base["file_message_ids"] = [
         m["message_id"] for m in msgs
         if m.get("message_type") in _RESOURCE_TYPES and m.get("message_id")]
+    base["forward_message_ids"] = [
+        m["message_id"] for m in msgs
+        if m.get("message_type") == "merge_forward" and m.get("message_id")]
     return base
 
 
