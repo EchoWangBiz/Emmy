@@ -52,15 +52,27 @@ git clone <repo> && cd emmy
 ### 第三步：`./start.sh` — 起 Emmy
 
 ```bash
-./start.sh              # 安装 launchd 后台守护，登录即自动运行
+./start.sh fg       # 前台运行，第一次调试推荐（看实时日志，Ctrl-C 退出）
 # 或
-./start.sh --foreground # 前台运行，方便第一次调试看日志
+./start.sh start    # 安装 launchd 后台守护，登录即自动运行、崩溃自愈
 ```
 
-起来之后，**把机器人拉进群，@它 发消息**：
+> 子命令一览：`fg`（前台）· `start`（后台常驻）· `stop` · `restart` · `status` · `logs`。
+
+起来之后，**把机器人拉进群，@它 发消息**。
+
+**新群第一次 @ 会先「配置门禁」**——Emmy 用对话带你把这个群一次性配好（这群干啥 / BUG 多维表格分享链接 / 代码项目本地路径 / 可选 Jenkins job），配好自动写进 `emmy.yaml`、标记完成，以后不再问。通常**不用手填配置文件**。
+
+配好之后就能直接使唤：
 
 ```
+# 通用飞书活
 @Emmy 帮我写一条今天的工作小结发到这个群
+
+# 旗舰能力：BUG 工单闭环（在「修 BUG 群」里）
+@Emmy 把群里信息齐的 BUG 都修了        # → 整理工单、派代码侧自动改码提 PR、修好 @你验收
+@Emmy #12 进度咋样了                   # → 按状态汇报当前盘子
+@Emmy 发布                            # → 把「待发布」的合进 DEV、jkit 构建、通知验收
 ```
 
 ---
@@ -71,22 +83,28 @@ git clone <repo> && cd emmy
 lark-cli doctor          # 飞书侧：config / auth / connectivity 全 pass
 claude -p "ok"           # 大脑侧：能正常返回
 ./start.sh status        # Emmy 进程在跑
-tail -f ~/Library/Logs/emmy/out.log   # 看实时日志
+./start.sh logs          # 看实时日志（tail ~/.emmy/logs/emmy.log）
 ```
 
 ## 日常操作
 
 ```bash
-./start.sh               # 起（后台常驻）
+./start.sh start         # 起（后台常驻）
 ./start.sh stop          # 停
+./start.sh restart       # 重启
 ./start.sh status        # 看状态
-tail -f ~/Library/Logs/emmy/out.log   # 看日志
+./start.sh logs          # 看日志
 ```
+
+> 日志都在 `~/.emmy/logs/`：主进程 `emmy.log` / `emmy.err.log`；后台修复 worker `worker-<chat>.log`、发布 worker `publish-<chat>.log`（可单独 `tail` 看某个群的活）。
 
 ## 常见问题
 
 - **@Emmy 没反应？** 依次确认：机器人已被拉进群、app 已"发布版本"、长连接订阅方式已保存（见 [ONBOARDING.md](ONBOARDING.md)）、`./start.sh status` 在跑。
 - **过一阵 Emmy 不回了？** 多半是 Claude Code 登录态过期。重新 `claude` 登录，或改用 `claude setup-token` 长期 token（后台长挂推荐）。
+- **修 BUG 群怎么配？** 把机器人拉进群、@它一次，跟着「配置门禁」对话走完即可（需要 BUG 多维表格的分享链接 + 代码项目的本地绝对路径；多仓按「前端/后端」分别给）。
+- **派工了但 worker 没动静？** 看 `~/.emmy/logs/worker-<chat>.log`。常见原因：BUG 信息不全（worker 会停在「待人工确认」并把疑问写进表里，等你补「提问人答复」后下一轮自动续修）、或代码仓库路径没配对。
+- **自动发布到 DEV 要什么？** 在跑 Emmy 这台机器上装好 `jkit` 并登录一次，再把每个项目的 Jenkins job 名告诉 Emmy（配置门禁里会问）。不配也行——那就只到「待发布」，发布人工来。
 - **Intel Mac？** 没问题，`init.sh` 用 `$(brew --prefix)` 自适应路径。
 - **Node 是 v26 不是 LTS？** 能用；`init.sh` 只会提醒、不强制降级。
 
