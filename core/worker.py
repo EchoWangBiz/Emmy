@@ -40,15 +40,17 @@ NEED_STATUS_OPTIONS = ("待修复", "修复中", "待人工确认", "待发布")
 # worker 的 worktree 一律开在【目标 repo 外】的 Emmy 自管目录，绝不在目标项目里留临时目录
 WORKTREE_BASE = os.path.expanduser("~/.emmy/worktrees")
 
-# 编号白名单：编号来自飞书表格（非受信外部输入），拼进 git 分支名/refspec 前必须过这个，
-# 只允许字母数字下划线、首字符非 '-'，挡掉 ':' '/' 空格 '-' 等——防 `bugfix/x:refs/heads/INJECTED`
-# 这类 refspec 注入（详见 emmy-dangerous-cmd-gate 备忘的「文件/表格内容→argv 间接注入」）。
-SAFE_NUM = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+# 编号→git 分支名：编号来自飞书表格（非受信外部输入），直接拼进分支/refspec 有注入风险
+# （`bugfix/x:refs/heads/INJECTED`）。不【拒绝】非纯字母数字的编号（用户常用 NO.001 / BUG-12 / #0001
+# 这种合法写法），而是【消毒】成只含字母数字下划线的 slug——任何编号都能用、分支名一定安全；
+# 显示/引用仍用原编号（详见 emmy-dangerous-cmd-gate 的「文件/表格内容→argv 间接注入」）。
+_UNSAFE_SLUG = re.compile(r"[^A-Za-z0-9_]+")
 
 
-def is_safe_num(num) -> bool:
-    """编号能否安全拼进 git 分支/refspec（只允许字母数字下划线）。纯函数。"""
-    return bool(SAFE_NUM.match(str(num or "")))
+def branch_slug(num) -> str:
+    """把 BUG 编号消毒成安全的 git 分支 slug（只留字母数字下划线）。空/全特殊字符 → 'bug'。纯函数。"""
+    s = _UNSAFE_SLUG.sub("_", str(num or "")).strip("_")[:64]
+    return s or "bug"
 
 
 # ---------------- prompt ----------------
@@ -449,13 +451,6 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
     bug = _field(rec.get("fields") or {})
     rid = rec["record_id"]
 
-    # 编号要拿去拼 git 分支名（bugfix/<编号>），非法字符会注入 refspec → 源头挡掉
-    if not is_safe_num(bug["编号"]):
-        await write_back(base_token, table_id, rid,
-                         {STATUS_FIELD: "待人工确认",
-                          "待确认问题": "问题编号「%s」含非法字符，我不敢拿它建分支（只允许字母数字下划线），群主改下编号哈" % bug["编号"]})
-        return {"id": bug["编号"], "result": "blocked", "q": "编号非法、没法建分支"}
-
     loc = repo_locate.locate(repo_path)
     if not loc:
         await write_back(base_token, table_id, rid,
@@ -465,7 +460,7 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
                 "reason": "代码路径好像不对，群主帮我核下 emmy.yaml 的 repo 哈"}
 
     top = loc["toplevel"]
-    branch = "bugfix/%s" % bug["编号"]
+    branch = "bugfix/%s" % branch_slug(bug["编号"])   # 编号消毒成安全 slug（NO.001→NO_001）
     # worktree 开到目标 repo 外（~/.emmy/worktrees/<repo>/<branch>），不污染目标项目
     repo_key = loc["url"].replace("https://", "").replace("/", "__")
     wt = os.path.join(WORKTREE_BASE, repo_key, branch.replace("/", "-"))
@@ -527,13 +522,7 @@ async def fix_one_multi(rec: dict, repos: dict, base_token: str, table_id: str) 
     跑完逐仓检测哪个分支推上去了 → 各自出 PR、回写（修复分支/PR 可能多条）。不靠「所属模块」路由。"""
     bug = _field(rec.get("fields") or {})
     rid = rec["record_id"]
-    if not is_safe_num(bug["编号"]):
-        await write_back(base_token, table_id, rid,
-                         {STATUS_FIELD: "待人工确认",
-                          "待确认问题": "问题编号「%s」含非法字符，我不敢拿它建分支，群主改下编号哈" % bug["编号"]})
-        return {"id": bug["编号"], "result": "blocked", "q": "编号非法、没法建分支"}
-
-    branch = "bugfix/%s" % bug["编号"]
+    branch = "bugfix/%s" % branch_slug(bug["编号"])   # 编号消毒成安全 slug
     parent = os.path.join(WORKTREE_BASE, "multi", branch.replace("/", "-"))
     located = []  # [(module, subdir, top, url, wt)]
     for module, path in repos.items():
@@ -717,13 +706,14 @@ def _selftest() -> None:
     ps = build_fix_prompt({"编号": "0024", "摘要": "x", "详情": "y"},
                           screenshots=["/x/a.jpg", "/x/b.png"])
     assert "📷" in ps and "Read" in ps and "/x/a.jpg" in ps and "/x/b.png" in ps
-    # 编号白名单：合法编号过、注入字符挡（防 refspec 注入）
-    assert is_safe_num("0024") and is_safe_num("BUG_12") and is_safe_num("abc")
-    assert not is_safe_num("x:refs/heads/INJECTED")   # 冒号注入
-    assert not is_safe_num("../main") and not is_safe_num("a/b")   # 斜杠
-    assert not is_safe_num("a-b") and not is_safe_num("-rf")       # 横线/像选项
-    assert not is_safe_num("") and not is_safe_num("?") and not is_safe_num("a b")
-    print("✓ is_safe_num 编号白名单（挡 refspec 注入 : / - 空格 等）")
+    # 编号→分支 slug：任何编号都消毒成只含字母数字下划线（不再拒绝 NO.001/BUG-12 这类合法编号，且防 refspec 注入）
+    assert branch_slug("0024") == "0024" and branch_slug("NO.001") == "NO_001"
+    assert branch_slug("BUG-12") == "BUG_12" and branch_slug("#0001") == "0001"
+    assert branch_slug("x:refs/heads/INJECTED") == "x_refs_heads_INJECTED"   # 冒号/斜杠消成 _
+    assert branch_slug("a/b") == "a_b" and branch_slug("-rf") == "rf"        # 斜杠/前导横线
+    assert branch_slug("") == "bug" and branch_slug("???") == "bug"          # 空/全特殊→兜底
+    assert "/" not in branch_slug("x/y") and ":" not in branch_slug("a:b")   # 保证无注入字符
+    print("✓ branch_slug 编号消毒成安全分支名（NO.001→NO_001，挡 : / 空格 等注入字符）")
 
     assert "第 0 步" in p and "先评估" in p          # 先评估难度
     assert "问一句" in p and "BLOCKED" in p           # 有疑问先问、别瞎找
