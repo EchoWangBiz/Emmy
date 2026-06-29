@@ -37,6 +37,8 @@ _ALLOWED_PREFIXES = (
     #     或 upsert（不带 --record-id 即建单条）。
     "base +record-batch-create", "base +record-upsert",
     "base +record-batch-update", "base +field-create",
+    # —— onboarding 自建 BUG 表（新增、无破坏；删/清表 table-delete/cells-clear 仍挡）——
+    "base +base-create", "base +table-create",
     # —— 往「附件/截图」列传图（转发 bug 登记用）；--file 仅限 ~/.emmy/ 下，见 _upload_files_safe ——
     "base +record-upload-attachment",
     # —— im 消息：读 ——
@@ -155,7 +157,10 @@ def _selftest() -> None:
     _okfile = os.path.expanduser("~/.emmy/fwd-attachments/om/lark-im-resources/img_v3_abc.jpg")
     assert not blocked(["base", "+record-upload-attachment", "--base-token", "t", "--table-id", "tb",
                         "--record-id", "rec1", "--field-id", "附件/截图", "--file", _okfile])
-    print("✓ 放行：base/im/contact 读写 + 建记录/upsert + 传截图(~/.emmy 下) + --help")
+    # onboarding 自建表：base-create / table-create 放行（新增、无破坏）
+    assert not blocked(["base", "+base-create", "--name", "BUG表", "--table-name", "BUG"])
+    assert not blocked(["base", "+table-create", "--base-token", "t", "--name", "BUG"])
+    print("✓ 放行：base/im/contact 读写 + 建记录/upsert + 传截图 + 自建表(base/table-create) + --help")
 
     # —— 不误杀（红队 false-positive 全消）：白名单内、关键词在 flag/数据值里 ——
     assert not blocked(["im", "+messages-send", "--as", "bot", "--chat-id", "oc_x",
