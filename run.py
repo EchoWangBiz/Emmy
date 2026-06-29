@@ -117,17 +117,21 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
 1) 先确认意图：这个群想让我干啥？目前我会【修 BUG】(role=fix-bug)。不是的话就先问清楚。
 
 2) 是修 BUG 的话，要这几样：
-   - BUG 多维表格的【分享链接】（我自己从 .../base/<app_token>?table=<table_id> 里取 token，不用谁手填）
+   - BUG 多维表格：**有现成的**就给【分享链接】（我从 `.../base/<app_token>?table=<table_id>` 取 token）；**没有就我自己建**、不用你动手（见第 3 步）
    - 代码项目的本地【绝对路径】——可能不止一个仓（前端 / 后端），按【模块→路径】分别问清（如 前端=/Users/xxx/llm-platform-web、后端=/Users/xxx/llm-platform）；只有一个仓也行
    - 【自动发布到 DEV 用】每个项目的 Jenkins job 名（按【模块→job 名】问，如 前端=llmmarket-platform-web-dev）。这步**可选**——不配就只到「待发布」、发布得人工，配了我才能在你说「发布」时自动合 DEV + 构建。
 
-3) 拿到表链接后，自检 + 自动补全表格（用 emmy-lark，token 用从链接解析出来的）：
-   - 先 `emmy-lark base +field-list --base-token <t> --table-id <tbl>` 看现有字段
-   - 缺这些就【自动建】(纯新增、低危)：问题编号、提问人、问题摘要、复现/期望/实际、状态、修复分支/PR、AI备注、待确认问题、提问人答复
-     文本字段：`emmy-lark base +field-create --base-token <t> --table-id <tbl> --json '{"name":"AI备注","type":"text"}'`
-     状态字段(select)：`--json '{"name":"状态","type":"select","options":[{"name":"待处理"},{"name":"待修复"},{"name":"修复中"},{"name":"待人工确认"},{"name":"待发布"},{"name":"待验收"},{"name":"已验收"},{"name":"不修"}]}'`
-   - ⚠️ 若【状态】字段已存在但选项不全，我改不了已有字段的选项——这种就明确请群主去多维表格把状态选项补成那 8 个，补好再继续
-   - 必须确保齐的：状态(含 8 选项)、修复分支/PR、AI备注、待确认问题
+3) 准备好 BUG 表（用 emmy-lark；已有表用链接里解析的 token，没有就先自建）：
+   - **没有现成表 → 我自己建一张**（你确认过要我自建，别再让群主手动建）：
+     `emmy-lark base +base-create --name "<群名> BUG表" --table-name "BUG"` —— 记下返回的 `app_token`(=base-token) 和首表 `table_id`。**别加 `--as bot`**（默认身份建，群成员才打得开）；返回里若有 permission_grant/权限提示就照实转告群主。
+   - 自检 + 自动补全字段（已有表也走这步）：先 `emmy-lark base +field-list --base-token <t> --table-id <tbl>` 看现有字段，缺的就【自动建】(纯新增、低危)：
+     - 文本字段（提问人 / 问题摘要 / 复现/期望/实际 / 负责人 / 修复分支/PR / AI备注 / 待确认问题 / 提问人答复）：`--json '{"name":"AI备注","type":"text"}'`
+     - 状态(select)：`--json '{"name":"状态","type":"select","options":[{"name":"待处理"},{"name":"待修复"},{"name":"修复中"},{"name":"待人工确认"},{"name":"待发布"},{"name":"待验收"},{"name":"已验收"},{"name":"不修"}]}'`
+     - 附件/截图：`--json '{"name":"附件/截图","type":"attachment"}'`（worker 从这列读截图，必须建）
+     - 提交时间：建成**自动「创建时间」** `--json '{"name":"提交时间","type":"created_time"}'`（自动填、不用谁手填）；若该类型报错就退用 `"type":"datetime"`
+     - 问题编号：`--json '{"name":"问题编号","type":"auto_number"}'`（系统自动编号；建不了就退用文本，登记时也别自己填编号）
+   - ⚠️ 若【状态】已存在但选项不全，我改不了已有字段选项 → 请群主去补成那 8 个
+   - 必须齐：状态(8 选项)、提问人、附件/截图、修复分支/PR、AI备注、待确认问题
 
 4) 表入口检查（非必须、可跳过）：先看群顶部是不是已经能找到这张 BUG 表的入口——不管是【消息 Pin】(`emmy-lark im pins list --chat-id __CID__`)、还是群顶部那排【文档标签页 / 云文档置顶】。只要已经有任一种入口能点开这张表，就别再重复发 / pin，跳过这步即可；确实一个入口都没有时，再发一条表入口消息并 pin 上：
    发 → `emmy-lark im +messages-send --as bot --chat-id __CID__ --msg-type text --content '{"text":"📊 BUG 表在这儿：<表链接>"}'`（记下返回的 message_id）
