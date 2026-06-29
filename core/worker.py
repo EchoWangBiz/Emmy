@@ -102,6 +102,51 @@ def build_fix_prompt(bug: dict, base_branch: str = "dev", screenshots: list = No
     )
 
 
+def _safe_seg(s) -> str:
+    """模块名→安全的目录段（保留中文/字母数字，其余换 _），用作多仓 worktree 子目录名。"""
+    seg = re.sub(r"[^\w一-鿿.-]", "_", str(s or "")).strip("_")
+    return seg[:40] or "repo"
+
+
+def build_fix_prompt_multi(bug: dict, repo_dirs: list, branch: str,
+                           base_branch: str = "dev", screenshots: list = None) -> str:
+    """多仓修复指引：把该群【所有仓】各挂一个 worktree 子目录，让 claude 跨仓修。
+    repo_dirs: [(模块名, 子目录名)] —— 子目录在 cwd 下，各自已在 bugfix 分支上。"""
+    extra = ("  ⚠️ 这条之前卡在「待人工确认」、提问人已补充：%s —— 按这个接着修。\n"
+             % bug["答复"]) if bug.get("答复") else ""
+    shot_block = ""
+    if screenshots:
+        paths = "\n".join("     - %s" % p for p in screenshots)
+        shot_block = ("📷【这条 BUG 配了截图，往往就是问题现场】**动手前先用 Read 逐张看图**：\n%s\n\n" % paths)
+    repo_lines = "\n".join("     - %s → 子目录 ./%s（用 `git -C %s ...` 操作这个仓，已在 %s 分支上）"
+                           % (m, d, d, branch) for m, d in repo_dirs)
+    return (
+        "你是代码侧修复 agent。这个群有多个代码仓，我已给【每个仓】各开一个 git worktree，挂在当前目录的子目录下，"
+        "你可以【跨仓】一起改（改动不影响别人工作副本，放心改）：\n%s\n\n"
+        "要修的 BUG：\n  编号: %s\n  摘要: %s\n  详情(复现/期望/实际): %s\n%s\n"
+        "%s"  # 截图段
+        "【怎么定位仓】先看【前端/web 那个仓】是不是前端就能解决（UI/样式/渲染/交互/碎图这类）；"
+        "如果发现根因要后端配合（接口返回、数据、图片 URL、字段缺失），就【也】去对应服务端仓改——"
+        "前后端联动的 bug 两边都改、保持一致。**只改真正需要动的仓，没动的仓【别碰、别提交】。**\n\n"
+        "⚠️【无人值守环境】没人能给你点批准：【绝对不要】跑测试/构建/dev server（被拦或超时卡死）；"
+        "验证交给 CI 和 PR review。bash 尽量单条、别套管道/复合。\n\n"
+        "【第 0 步：先评估】先判断根因在哪个仓、看懂没、有没有歧义；想清楚写一两句【根因判断+计划】再动手。"
+        "信息不足/有歧义/拿不准 → 【立刻】返回 BLOCKED 问具体——问一句胜过瞎找半天。\n"
+        "【绝不白干】时间有限（约 18 分钟），改完就提交推分支给 DONE；卡住/快超时就【立刻】BLOCKED 并写清"
+        "已查明的根因/可疑文件/卡点/思路——绝不允许跑半天啥也没留下。\n\n"
+        "请按流程（每个【你改了的】仓都做一遍，没改的仓跳过）：\n"
+        "1. 在该仓子目录里改最小必要代码。\n"
+        "2. 分两条提交：`git -C <子目录> add -A` 然后 `git -C <子目录> commit -m '改了啥'`。\n"
+        "3. 推分支：`git -C <子目录> push -u origin %s`。GitLab 的 push 输出里有 MR 链接（我会自己据分支构造，你不用抄）。\n"
+        "   ⚠️ 绝不 merge、绝不 push %s/main、绝不自己合 MR/PR —— 只到『可 review』就停。\n\n"
+        "最后一行必须是下面之一（便于我解析）：\n"
+        "  DONE: <一句话：改了哪个/哪些仓、各改了啥>\n"
+        "  BLOCKED: <根因/可疑文件/卡点/思路 或 要问提问人的具体问题>\n"
+        % (repo_lines, bug.get("编号", "?"), bug.get("摘要", ""), bug.get("详情", ""), extra,
+           shot_block, branch, base_branch)
+    )
+
+
 def parse_worker_reply(text: str) -> dict:
     """从 claude 最终回复里抠出 DONE/BLOCKED。"""
     for line in reversed((text or "").strip().splitlines()):
@@ -477,6 +522,78 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
         repo_locate.remove_worktree(top, wt)  # 清 worktree，保留分支(供 PR)
 
 
+async def fix_one_multi(rec: dict, repos: dict, base_token: str, table_id: str) -> dict:
+    """多仓修复：给该群【所有仓】各开一个 worktree（挂同一父目录的子目录），跑一次 claude 跨仓修，
+    跑完逐仓检测哪个分支推上去了 → 各自出 PR、回写（修复分支/PR 可能多条）。不靠「所属模块」路由。"""
+    bug = _field(rec.get("fields") or {})
+    rid = rec["record_id"]
+    if not is_safe_num(bug["编号"]):
+        await write_back(base_token, table_id, rid,
+                         {STATUS_FIELD: "待人工确认",
+                          "待确认问题": "问题编号「%s」含非法字符，我不敢拿它建分支，群主改下编号哈" % bug["编号"]})
+        return {"id": bug["编号"], "result": "blocked", "q": "编号非法、没法建分支"}
+
+    branch = "bugfix/%s" % bug["编号"]
+    parent = os.path.join(WORKTREE_BASE, "multi", branch.replace("/", "-"))
+    located = []  # [(module, subdir, top, url, wt)]
+    for module, path in repos.items():
+        loc = repo_locate.locate(path)
+        if not loc:
+            for _m, _d, _top, _u, _w in located:
+                repo_locate.remove_worktree(_top, _w)
+            await write_back(base_token, table_id, rid,
+                             {STATUS_FIELD: "待人工确认",
+                              "AI备注": "项目定位失败：模块「%s」路径 %s 不是有效 git 仓库" % (module, path)})
+            return {"id": bug["编号"], "result": "locate-fail",
+                    "reason": "模块「%s」的代码路径好像不对，群主核下 emmy.yaml" % module}
+        subdir = _safe_seg(module)
+        wt = os.path.join(parent, subdir)
+        repo_locate.remove_worktree(loc["toplevel"], wt)
+        ok, msg = repo_locate.make_worktree(loc["toplevel"], branch, wt, base="dev")
+        if not ok:
+            for _m, _d, _top, _u, _w in located:
+                repo_locate.remove_worktree(_top, _w)
+            await write_back(base_token, table_id, rid,
+                             {STATUS_FIELD: "待人工确认", "AI备注": "worktree 创建失败（%s）：%s" % (module, msg[:150])})
+            return {"id": bug["编号"], "result": "worktree-fail", "reason": "我这边开发环境出了点问题"}
+        located.append((module, subdir, loc["toplevel"], loc["url"], wt))
+
+    try:
+        await write_back(base_token, table_id, rid, {STATUS_FIELD: "修复中"})
+        shots = await download_bug_attachments(base_token, table_id, rid)
+        prompt = build_fix_prompt_multi(bug, [(m, d) for m, d, _t, _u, _w in located], branch, screenshots=shots)
+        res = await _run_claude(prompt, cwd=parent)
+        if res.get("error") == "timeout":
+            analysis = (res.get("analysis") or "").strip()
+            q = ("这条偏复杂、限定时间没改完。已查到的线索：%s" % analysis) if analysis \
+                else "这条限定时间没改完、也没留下清晰线索，麻烦人工接手哈。"
+            await write_back(base_token, table_id, rid,
+                             {STATUS_FIELD: "待人工确认", "待确认问题": q[:500], "AI备注": "worker 超时未完成"})
+            return {"id": bug["编号"], "result": "blocked", "q": q}
+        reply = parse_worker_reply(res.get("text", ""))
+        # 逐仓检测哪个分支真推上去了（= 实际改动的仓）
+        fixed = [(m, u) for m, _d, top, u, _w in located if repo_locate.branch_on_remote(top, branch)]
+        if fixed:
+            pr_text = " | ".join("%s: %s" % (m, _mr_url(u, branch)) for m, u in fixed)
+            wrote = await write_back(base_token, table_id, rid,
+                                     {STATUS_FIELD: "待发布", "修复分支/PR": pr_text,
+                                      "AI备注": ("改了：%s。%s" % ("、".join(m for m, _ in fixed), reply.get("note", "")))[:300]})
+            return {"id": bug["编号"], "result": "done", "pr": pr_text, "wrote": wrote}
+        # 没有任何仓推上去
+        if reply["outcome"] == "blocked":
+            await write_back(base_token, table_id, rid,
+                             {STATUS_FIELD: "待人工确认", "待确认问题": reply.get("question", "")})
+            return {"id": bug["编号"], "result": "blocked", "q": reply.get("question")}
+        await write_back(base_token, table_id, rid,
+                         {STATUS_FIELD: "待人工确认",
+                          "AI备注": ("worker 未推任何分支（说：%s）" % reply.get("note", ""))[:200]})
+        return {"id": bug["编号"], "result": "unknown",
+                "reason": "我处理了一下但没改出能提交的东西，麻烦人工看一眼"}
+    finally:
+        for _m, _d, top, _u, wt in located:
+            repo_locate.remove_worktree(top, wt)
+
+
 async def run_worker(chat_id: str) -> list:
     cc = config.chat_config(chat_id)
     if not cc or cc.get("role") != "fix-bug":
@@ -516,20 +633,11 @@ async def run_worker(chat_id: str) -> list:
             for rec in pend:  # 串行：一条条修，稳
                 seen.add(rec["record_id"])
                 bug = _field(rec.get("fields") or {})
-                # 多 repo：按「所属模块」路由到对的仓库；路由不出来就 BLOCKED、让提问人指定
-                module = (rec.get("fields") or {}).get("所属模块", "")
-                repo_path = _pick_repo(repos, module)
-                if not repo_path:
-                    await write_back(base_token, table_id, rec["record_id"],
-                                     {STATUS_FIELD: "待人工确认",
-                                      "待确认问题": "不确定改哪个仓库（所属模块=%s，可选：%s），帮我指定下~"
-                                      % (module or "(空)", " / ".join(repos))})
-                    paired.append((rec, {"id": bug["编号"], "result": "blocked",
-                                         "q": "不确定改哪个仓库，需指定模块"}))
-                    print("  -> route-fail", bug["编号"])
-                    continue
                 await _send_group(chat_id, "#%s 我开始改了，大概几分钟，改完 @你~ 🛠️" % bug["编号"])  # 开工播报
-                r = await fix_one(rec, repo_path, base_token, table_id)
+                if len(repos) > 1:   # 多仓：挂【全部仓】跨仓修（先看前端、需要再连服务端），不再靠「所属模块」路由
+                    r = await fix_one_multi(rec, repos, base_token, table_id)
+                else:                # 单仓：直接用那一个
+                    r = await fix_one(rec, next(iter(repos.values())), base_token, table_id)
                 paired.append((rec, r))
                 print("  ->", r)
         if paired:
@@ -742,6 +850,16 @@ def _selftest() -> None:
     bp = build_fix_prompt({"编号": "6", "摘要": "x", "详情": "y", "答复": "用方案B"})
     assert "用方案B" in bp and "提问人已补充" in bp
     print("✓ BLOCKED 续修：_should_fix 判定 + build_fix_prompt 带补充答复")
+
+    # 12) 多仓：_safe_seg + build_fix_prompt_multi（挂全部仓、跨仓修、先看前端、各仓 git -C）
+    assert _safe_seg("前端") == "前端" and _safe_seg("a/b c") == "a_b_c" and _safe_seg("") == "repo"
+    mp = build_fix_prompt_multi({"编号": "0001", "摘要": "碎图", "详情": "上传后碎图"},
+                                [("前端", "前端"), ("服务端", "服务端")], "bugfix/0001")
+    assert "0001" in mp and "碎图" in mp
+    assert "跨仓" in mp and "没动的仓" in mp and "前端/web" in mp        # 跨仓 + 只改需要的 + 先看前端
+    assert "git -C 前端" in mp and "git -C 服务端" in mp                # 各仓用 git -C 操作
+    assert "DONE:" in mp and "BLOCKED:" in mp and "无人值守" in mp
+    print("✓ build_fix_prompt_multi：多仓跨仓指引（先看前端/只改需要的/各仓 git -C/契约）+ _safe_seg")
 
     print("\nworker 纯逻辑自测全部通过 ✅（端到端真改代码需 emmy.yaml 配好 MASS repo 后一起测）")
 
