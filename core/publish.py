@@ -2,14 +2,15 @@
 """
 core/publish.py —— 发布 worker（把「待发布」的修复合进 dev 并触发 Jenkins 部署）
 
-被 run.py 在收到 Emmy 的 <PUBLISH/> 信号后拉起（确定性框架代码、不经 claude）。
-主链路：读表「待发布」→ 按 repo 分组 → 把各 bugfix 分支合进 dev、push → jkit 构建 dev
-        → ✅ 成功：状态→待验收 + 群通知（不 @人）；
-        → ❌ 冲突/构建失败：jkit diagnose 抓错、报群，状态不动。
+被 run.py 在收到 Emmy 的 <PUBLISH/> 信号后拉起。
+主链路：读表「待发布」→ 逐仓按 `bugfix/branch_slug(编号)` 查分支在哪个仓（worker 改了哪些仓就推了哪些）
+        → 配置闸（jkit 装没 + 项目有没有自己的 publish skill）→ 把各 bugfix 分支【合进 dev、push】（确定性）
+        → 让【项目自己的 publish skill】把 dev 部署上去（起 claude 在项目仓里跑它，只发 dev）
+        → ✅ 成功：状态→待验收 + 群通知；❌ 失败：报群、状态不动。
 
-⚠️ 这是【唯一】被允许 push dev 的地方（用户确认放开红线）：只合「待发布」记录对应的
-   bugfix 分支、只进 dev 绝不碰 main、干净合并才推、冲突即停、绝不 force。
-   危险动作全在这份确定性代码里、参数硬编码，不让 claude 自由发挥。
+⚠️ 合 dev 是【唯一】被允许 push dev 的地方（确定性、参数硬编码）：只合「待发布」对应的 bugfix、只进 dev
+   绝不碰 main、干净合并才推、冲突即停、绝不 force。**部署的 know-how 在每个项目自己的 publish skill 里**
+   （它自己知道 jkit job + tag→push→jkit run 流程），Emmy 不重造、只检查 skill 在不在 + 触发它。
 
 跑法：python core/publish.py <chat_id>
 """
@@ -22,13 +23,21 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core import worker, config, repo_locate  # noqa: E402  复用成熟函数
+from core import worker, config, repo_locate, claude_runner  # noqa: E402  复用成熟函数
 
 PIPE = asyncio.subprocess.PIPE
 PUBLISH_WT_BASE = os.path.expanduser("~/.emmy/publish-worktrees")
 _TMP_BRANCH = "_emmy_publish_tmp"
 _PUBLISH_STATUS = "待发布"
 _DEPLOYED_STATUS = "待验收"
+
+# 部署交给【项目自己的 publish skill】跑（claude 在项目仓里执行它，发布 know-how 在项目里、不在 Emmy）：
+# 放开 git + jkit（skill 要用），仍挡破坏性命令。
+DEPLOY_ALLOWED = ("Bash(git:*) Bash(jkit:*) Bash(ls:*) Bash(cat:*) Bash(grep:*) "
+                  "Bash(tail:*) Bash(head:*) Read")
+DEPLOY_DISALLOWED = ["Bash(rm:*)", "Bash(sudo:*)", "Bash(curl:*)"]
+# 项目自己的 publish skill 可能在的位置（.claude 或 .agents）
+_PUBLISH_SKILL_PATHS = (".claude/skills/publish/SKILL.md", ".agents/skills/publish/SKILL.md")
 
 
 # ---------------- 挑「待发布」记录（纯函数，复用 worker._flatten）----------------
@@ -50,19 +59,10 @@ def pending_publish(listing: dict) -> list:
     return out
 
 
-def _jenkins_job(cc: dict, module: str, sole: bool = False):
-    """按模块选 Jenkins job（jenkins_jobs: {模块名: job}）。sole=True(本次只有一个模块要发) 且只有一个 job
-    → 直接用；否则【严格】按模块名匹配——多模块时绝不拿单个 job 顶替别的模块（否则会把后端构建成前端 job）。纯函数。"""
-    jobs = {k: v for k, v in (cc.get("jenkins_jobs") or {}).items() if v}
-    if not jobs:
-        return None
-    if sole and len(jobs) == 1:
-        return next(iter(jobs.values()))
-    m = (module or "").strip()
-    for name, job in jobs.items():
-        if name == module or (m and (name in m or m in name)):
-            return job
-    return None
+def _has_publish_skill(repo_top: str) -> bool:
+    """项目仓里有没有自己的 publish skill（`.claude/skills/publish/` 或 `.agents/skills/publish/`）。
+    发布能力是项目自带的（它自己知道 jkit job + 完整流程），Emmy 只检查它在不在。纯函数。"""
+    return any(os.path.isfile(os.path.join(repo_top, p)) for p in _PUBLISH_SKILL_PATHS)
 
 
 # 发布范围同义词：用户说「部署前端/web」「部署后端/server」时，对上记录的「所属模块」
@@ -144,30 +144,52 @@ def merge_branches_to_dev(repo_path: str, branches: list, base: str = "dev") -> 
     return {"merged": merged, "conflicts": conflicts, "missing": missing, "pushed": pushed, "error": error}
 
 
-# ---------------- jkit：触发 Jenkins 构建 / 排错 ----------------
-async def _run_jkit(args: list, timeout: int = 1800) -> tuple:
-    """跑 jkit，返回 (ok, output)。jkit 没装 → (False, '__NO_JKIT__')；超时 → (False, '__TIMEOUT__')。"""
+# ---------------- 部署：让【项目自己的 publish skill】干（claude 在项目仓里跑它）----------------
+def _parse_deploy(text: str) -> tuple:
+    """从 claude 回复抠最后的 `DEPLOYED:` 行 → (ok, 摘要)。纯函数。"""
+    for line in reversed((text or "").strip().splitlines()):
+        s = line.strip()
+        if s.startswith("DEPLOYED:"):
+            body = s[len("DEPLOYED:"):].strip()
+            up = body.upper()
+            return (("SUCCESS" in up and "FAIL" not in up), body)
+    return False, "claude 没给明确部署结果：" + (text or "")[:200]
+
+
+async def _deploy_dev_via_skill(repo_top: str, timeout: int = 900) -> tuple:
+    """在该项目仓【基于 origin/dev 的临时 worktree】里起一个 claude，让它【用本项目自己的 publish skill】
+    把代码部署到 dev（绝不 prod）。返回 (ok, 摘要)。Emmy 不碰 jkit/job 名——发布 know-how 在项目 skill 里。"""
+    uniq = "%d_%d" % (os.getpid(), int(time.time()))
+    wt = os.path.join(PUBLISH_WT_BASE, "deploy-%s" % uniq)
+    dbranch = "_emmy_deploy_%s" % uniq
+    _g(repo_top, ["fetch", "origin", "dev"], timeout=120)
+    _g(repo_top, ["worktree", "remove", "--force", wt])
+    r = _g(repo_top, ["worktree", "add", "--force", "-b", dbranch, wt, "origin/dev"])
+    if r.returncode != 0:
+        return False, "建部署 worktree 失败：%s" % (r.stderr or r.stdout)[:150]
+    prompt = (
+        "把【本项目】部署到 **dev**（绝不是 prod）。这个项目自带发布能力——**读它自己的 publish skill**"
+        "（`.claude/skills/publish/SKILL.md`，没有就 `.agents/skills/publish/SKILL.md`），**严格照它的流程做**"
+        "（通常：打 dev 时间戳 tag → push tag → `jkit run <该项目的 dev job> --wait`）。\n"
+        "⚠️【只发 dev】：绝对不要发 prod、不要碰任何 `*-prod` job。无人值守：别跑测试/构建/dev-server，bash 尽量单条。\n"
+        "跑完最后一行【必须】是下面之一，便于我解析：\n"
+        "  DEPLOYED: SUCCESS | <Build号/一句话>\n"
+        "  DEPLOYED: FAILURE | <关键错误>")
+    cmd = ["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "default",
+           "--allowedTools", DEPLOY_ALLOWED, "--disallowedTools", *DEPLOY_DISALLOWED,
+           "--model", "claude-sonnet-4-6", "--strict-mcp-config"]
+    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec("jkit", *args, stdout=PIPE, stderr=asyncio.subprocess.STDOUT)
-    except FileNotFoundError:
-        return False, "__NO_JKIT__"
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        proc = await asyncio.create_subprocess_exec(*cmd, cwd=wt, stdout=PIPE, stderr=PIPE)
+        out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return _parse_deploy(claude_runner.parse_result(out.decode("utf-8", "replace")).get("text", ""))
     except asyncio.TimeoutError:
-        proc.kill()
-        return False, "__TIMEOUT__"
-    return proc.returncode == 0, out.decode("utf-8", "replace")
-
-
-async def jenkins_build(job: str) -> tuple:
-    """触发 dev 构建并同步等完成。返回 (ok, output)。"""
-    return await _run_jkit(["run", job, "--wait", "--log"])
-
-
-async def jenkins_diagnose(job: str) -> str:
-    """构建失败时抓错误上下文（不刷全量日志）。"""
-    _ok, out = await _run_jkit(["diagnose", job], timeout=180)
-    return out
+        if proc:
+            proc.kill()
+        return False, "部署超时（claude 没在限定时间内跑完项目的 publish skill）"
+    finally:
+        _g(repo_top, ["worktree", "remove", "--force", wt])
+        _g(repo_top, ["branch", "-D", dbranch])
 
 
 def _nums(branches: list) -> str:
@@ -194,24 +216,24 @@ def _route_by_branches(pend: list, modules: list, branch_exists) -> dict:
     return routed
 
 
-def _config_gaps(modules_with_work: list, jobs: dict, jkit_present: bool) -> list:
-    """发布前配置完整性检查（确定性）：jkit 装没 + 涉及的每个模块有没有 Jenkins job。
-    返回缺失项文案列表（空=配置完整、可发）。纯函数。"""
+def _config_gaps(modules_with_work: list, located: dict, jkit_present: bool) -> list:
+    """发布前配置完整性检查（确定性）：jkit 装没 + 涉及的每个项目有没有【自己的 publish skill】。
+    返回缺失项文案列表（空=完整可发）。发布能力是项目自带的，不在 emmy.yaml。纯函数。"""
     gaps = []
     if not jkit_present:
-        gaps.append("这台机器还没装 jkit（自动发布要用它触发 Jenkins 构建）——在 init.sh 里装一下、并 jkit auth login。")
-    sole = len(modules_with_work) == 1
+        gaps.append("这台机器没装 jkit（项目的 publish skill 要靠它触发 Jenkins）——装一下并 `jkit auth login`。")
     for m in modules_with_work:
-        if not _jenkins_job({"jenkins_jobs": jobs}, m, sole=sole):
-            gaps.append("模块「%s」还没配 Jenkins job——在 emmy.yaml 的 jenkins_jobs 里加一条「%s: <job名>」。" % (m, m))
+        if not _has_publish_skill(located[m]["top"]):
+            gaps.append("项目「%s」(%s) 没有自己的 publish skill（应在 `.claude/skills/publish/`）——"
+                        "发布能力是项目自带的，补上它我才能发。" % (m, located[m].get("path", "")))
     return gaps
 
 
 # ---------------- 主流程 ----------------
 async def run_publish(chat_id: str, scope: str = "") -> None:
-    """先做【配置完整性闸】(jkit 装没 + 涉及模块有没有 job)：齐了才发、缺了精确告诉去配。
-    路由不靠「所属模块」——按 branch_slug 拼分支、逐仓查它在哪个仓远程(worker 改了哪些仓就推了哪些)。
-    scope：空=全发；指定(前端/web、后端/server)=只发对应模块(多仓时)。"""
+    """发布 = 合「待发布」分支进 dev + push（确定性，唯一碰 dev 处）→ 让【项目自己的 publish skill】部署 dev。
+    先做配置闸（jkit 装没 + 项目有没有自己的 publish skill）：齐了才发、缺了精确告诉去配。
+    路由不靠「所属模块」——按 branch_slug 拼分支、逐仓查它在哪个仓远程。scope：空=全发；指定=只发对应模块(多仓时)。"""
     cc = config.chat_config(chat_id)
     if not cc or cc.get("role") != "fix-bug":
         print("chat %s 未配置为 fix-bug 群" % chat_id, flush=True)
@@ -219,7 +241,6 @@ async def run_publish(chat_id: str, scope: str = "") -> None:
     base_token, table_id = cc.get("base_app_token"), cc.get("base_table_id")
     repos = {k: v for k, v in (cc.get("repos") or
              ({"默认": cc.get("repo")} if cc.get("repo") else {})).items() if v}
-    jobs = {k: v for k, v in (cc.get("jenkins_jobs") or {}).items() if v}
     if not (base_token and table_id and repos):
         print("emmy.yaml 缺 base/repos", flush=True)
         return
@@ -254,13 +275,13 @@ async def run_publish(chat_id: str, scope: str = "") -> None:
         await worker._send_group(chat_id, "这些「待发布」的，我在仓里没找到对应的 bugfix 分支（没真推过？编号对不上？）：%s" % nums)
         return
 
-    # ★ 配置完整性闸（B）：齐了才发，缺了精确告诉去配——不再半路崩/假通
-    gaps = _config_gaps(list(routed), jobs, shutil.which("jkit") is not None)
+    # ★ 配置完整性闸：jkit 装没 + 涉及项目有没有自己的 publish skill——齐了才发，缺了精确告诉去配
+    gaps = _config_gaps(list(routed), located, shutil.which("jkit") is not None)
     if gaps:
         await worker._send_group(chat_id, "发布前还差点配置，配好再喊我发哈：\n%s" % "\n".join("· " + g for g in gaps))
         return
 
-    # 逐仓：合进 dev → jkit 构建该仓 job → 转待验收
+    # 逐仓：合进 dev + push（确定性）→ 让项目自己的 publish skill 部署 dev → 转待验收
     published = []
     for module in routed:
         items = routed[module]                                   # [(branch, rec)]
@@ -274,28 +295,23 @@ async def run_publish(chat_id: str, scope: str = "") -> None:
         if not mr["pushed"]:
             await worker._send_group(chat_id, mr.get("error") or ("[%s] 推 dev 没成，稍后重试" % module))
             continue
-        job = _jenkins_job(cc, module, sole=len(routed) == 1)    # 闸已保证有
-        ok, out = await jenkins_build(job)
-        if out == "__NO_JKIT__":                                 # 闸理论上挡过了，纯兜底
-            await worker._send_group(chat_id, "这台机器没装/没配 jkit，发布跑不了 🦊")
-            break
-        merged = set(mr["merged"])
-        ok_recs = [r for b, r in items if b in merged]
+        # 部署：起 claude 在项目仓里跑【项目自己的 publish skill】（只发 dev）
+        ok, summary = await _deploy_dev_via_skill(located[module]["top"])
+        ok_recs = [r for b, r in items if b in set(mr["merged"])]
         if ok:
             rids = [r["record_id"] for r in ok_recs]
             wok, _ = await worker._lark_json(worker.build_update_cmd(base_token, table_id, rids,
                                                                      {worker.STATUS_FIELD: _DEPLOYED_STATUS}))
             if wok:
                 published += [worker._field(r["fields"])["编号"] for r in ok_recs]
-            else:   # 构建过了但表没写进去：别报假成功，告知人工兜底（表里仍「待发布」，下次幂等重试）
-                await worker._send_group(chat_id, "⚠️ [%s] 构建通过、但回写表状态失败（仍「待发布」）——"
+            else:   # 部署成功但表没写进去：别报假成功，告知人工兜底（表里仍「待发布」，下次幂等重试）
+                await worker._send_group(chat_id, "⚠️ [%s] 部署成功、但回写表状态失败（仍「待发布」）——"
                                          "群主手动改「待验收」或稍后再喊我发一次：%s" % (module, _nums(branches)))
         else:
-            tip = "构建超时" if out == "__TIMEOUT__" else _tail(await jenkins_diagnose(job), 400)
-            await worker._send_group(chat_id, "❌ [%s] dev 构建失败：\n%s" % (module, tip))
+            await worker._send_group(chat_id, "❌ [%s] dev 部署没成：%s" % (module, summary))
 
     if published:
-        await worker._send_group(chat_id, "✅ 已合进 DEV、构建通过~ 这些可以验收了：%s 🛠️"
+        await worker._send_group(chat_id, "✅ 已合进 DEV 并部署成功~ 这些可以验收了：%s 🛠️"
                                  % "、".join("#" + n for n in dict.fromkeys(published)))
 
 
@@ -312,14 +328,11 @@ def _selftest() -> None:
     assert pending_publish({}) == []
     print("✓ pending_publish 只挑「待发布」")
 
-    # 2) _jenkins_job：唯一模块+唯一 job 才兜底直接用；否则严格按模块匹配（多模块不拿单 job 顶替别人）
-    assert _jenkins_job({"jenkins_jobs": {"前端": "web-dev"}}, "随便", sole=True) == "web-dev"   # 唯一→直接用
-    assert _jenkins_job({"jenkins_jobs": {"前端": "web-dev"}}, "随便") is None                   # 非 sole→严格→不匹配
-    cc = {"jenkins_jobs": {"前端": "web-dev", "后端": "srv-dev"}}
-    assert _jenkins_job(cc, "前端门户") == "web-dev" and _jenkins_job(cc, "后端服务") == "srv-dev"
-    assert _jenkins_job(cc, "数据库") is None and _jenkins_job(cc, "随便", sole=True) is None     # 多 job 即使 sole 也严格
-    assert _jenkins_job({}, "x") is None                                              # 没配
-    print("✓ _jenkins_job 模块→job（唯一兜底/多 job 严格匹配/匹配不出）")
+    # 2) _parse_deploy：抠 claude 的 DEPLOYED: 行 → (ok, 摘要)
+    assert _parse_deploy("...\nDEPLOYED: SUCCESS | Build #12") == (True, "SUCCESS | Build #12")
+    assert _parse_deploy("DEPLOYED: FAILURE | jkit 报错")[0] is False
+    assert _parse_deploy("没头没尾")[0] is False
+    print("✓ _parse_deploy 解析 DEPLOYED SUCCESS/FAILURE")
 
     # 3) _scope_match：发布范围过滤（空=全发；同义词；空模块+指定范围不误发）
     assert _scope_match("前端门户", "") is True            # 没指定范围 → 都发
@@ -348,12 +361,20 @@ def _selftest() -> None:
     assert _route_by_branches(pend2, ["前端", "服务端"], lambda m, b: False) == {}   # 哪个仓都没这分支→空
     print("✓ _route_by_branches：branch_slug(NO.001→NO_001) + 逐仓按分支存在路由")
 
-    # 6) _config_gaps：jkit 没装 / 模块缺 job → 精确报缺；齐了→空（这就是"完整即发、不完整让用户配"的闸）
-    g = _config_gaps(["前端", "服务端"], {"前端": "j1"}, jkit_present=True)
-    assert any("服务端" in x and "job" in x for x in g) and not any("前端" in x for x in g), g  # 只服务端缺 job
-    assert any("jkit" in x for x in _config_gaps(["前端"], {"前端": "j1"}, jkit_present=False))  # 没装 jkit
-    assert _config_gaps(["前端"], {"前端": "j1"}, jkit_present=True) == []                       # 配置完整→放行
-    print("✓ _config_gaps：缺 jkit/缺 job 精确报、配置齐了放行")
+    # 6) _has_publish_skill + _config_gaps：发布能力 = 项目自己的 publish skill；缺它/缺 jkit 精确报
+    import tempfile
+    d_with = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d_with, ".claude", "skills", "publish"))
+    open(os.path.join(d_with, ".claude", "skills", "publish", "SKILL.md"), "w").close()
+    d_without = tempfile.mkdtemp()
+    assert _has_publish_skill(d_with) and not _has_publish_skill(d_without)
+    located = {"前端": {"top": d_with, "path": "/x/web"}, "服务端": {"top": d_without, "path": "/x/srv"}}
+    g = _config_gaps(["前端", "服务端"], located, jkit_present=True)
+    assert any("服务端" in x and "publish skill" in x for x in g) and not any("前端" in x for x in g), g  # 只服务端缺
+    assert any("jkit" in x for x in _config_gaps(["前端"], located, jkit_present=False))   # 没装 jkit
+    assert _config_gaps(["前端"], located, jkit_present=True) == []                        # 前端有 skill+jkit→放行
+    shutil.rmtree(d_with); shutil.rmtree(d_without)
+    print("✓ _has_publish_skill + _config_gaps：项目缺 publish skill / 没 jkit 精确报、齐了放行")
 
     print("\npublish 纯逻辑自测通过 ✅（合并 dev + jkit 构建需真环境，配好 jkit 后端到端测）")
 
