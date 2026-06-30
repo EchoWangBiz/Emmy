@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import time
 
@@ -49,11 +50,19 @@ def pending_publish(listing: dict) -> list:
     return out
 
 
-def _jenkins_job(cc: dict, module: str):
-    """按「所属模块」选 Jenkins job 名（jenkins_jobs: {模块名: job}）。复用 _pick_repo 的匹配逻辑：
-    只一个 job → 直接用；多个 → 按模块名模糊匹配；匹配不出 → None。纯函数。"""
+def _jenkins_job(cc: dict, module: str, sole: bool = False):
+    """按模块选 Jenkins job（jenkins_jobs: {模块名: job}）。sole=True(本次只有一个模块要发) 且只有一个 job
+    → 直接用；否则【严格】按模块名匹配——多模块时绝不拿单个 job 顶替别的模块（否则会把后端构建成前端 job）。纯函数。"""
     jobs = {k: v for k, v in (cc.get("jenkins_jobs") or {}).items() if v}
-    return worker._pick_repo(jobs, module)
+    if not jobs:
+        return None
+    if sole and len(jobs) == 1:
+        return next(iter(jobs.values()))
+    m = (module or "").strip()
+    for name, job in jobs.items():
+        if name == module or (m and (name in m or m in name)):
+            return job
+    return None
 
 
 # 发布范围同义词：用户说「部署前端/web」「部署后端/server」时，对上记录的「所属模块」
@@ -88,7 +97,7 @@ def merge_branches_to_dev(repo_path: str, branches: list, base: str = "dev") -> 
     """在【临时 worktree】里把 branches 逐个合进 base、push origin base。
     不碰用户工作副本（独立 worktree + 临时分支，结果 push 到 origin/<base>）、绝不 force。
     返回 {merged:[分支], conflicts:[分支], missing:[分支], pushed:bool, error:str}。
-    注：branches 里的编号已由调用方过白名单（is_safe_num），这里再用【显式锚定 refspec】作纵深防御。"""
+    注：branches 名已由调用方用 branch_slug 消毒成只含字母数字下划线，这里再用【显式锚定 refspec】作纵深防御。"""
     repo_key = (repo_locate.repo_origin(repo_path) or repo_path).replace("https://", "").replace("/", "__")
     uniq = "%d_%d" % (os.getpid(), int(time.time()))   # 唯一后缀：并发发布不互踩、不误删同名分支
     wt = os.path.join(PUBLISH_WT_BASE, "%s-%s" % (repo_key, uniq))
@@ -170,10 +179,39 @@ def _tail(text: str, n: int = 500) -> str:
     return text[-n:] if len(text) > n else text
 
 
+# ---------------- 路由 + 配置闸（纯函数，便于自测，不再假通）----------------
+def _route_by_branches(pend: list, modules: list, branch_exists) -> dict:
+    """每条「待发布」→ `bugfix/branch_slug(编号)` → 逐仓查这个分支在不在该仓远程（worker 改了哪些仓就推了
+    哪些分支），路由到对应仓。不靠「所属模块」。branch_exists(module, branch)->bool 由调用方注入（便于测）。
+    返回 {module: [(branch, rec)]}。"""
+    routed = {}
+    for rec in pend:
+        num = worker._field(rec.get("fields") or {})["编号"]
+        branch = "bugfix/%s" % worker.branch_slug(num)
+        for m in modules:
+            if branch_exists(m, branch):
+                routed.setdefault(m, []).append((branch, rec))
+    return routed
+
+
+def _config_gaps(modules_with_work: list, jobs: dict, jkit_present: bool) -> list:
+    """发布前配置完整性检查（确定性）：jkit 装没 + 涉及的每个模块有没有 Jenkins job。
+    返回缺失项文案列表（空=配置完整、可发）。纯函数。"""
+    gaps = []
+    if not jkit_present:
+        gaps.append("这台机器还没装 jkit（自动发布要用它触发 Jenkins 构建）——在 init.sh 里装一下、并 jkit auth login。")
+    sole = len(modules_with_work) == 1
+    for m in modules_with_work:
+        if not _jenkins_job({"jenkins_jobs": jobs}, m, sole=sole):
+            gaps.append("模块「%s」还没配 Jenkins job——在 emmy.yaml 的 jenkins_jobs 里加一条「%s: <job名>」。" % (m, m))
+    return gaps
+
+
 # ---------------- 主流程 ----------------
 async def run_publish(chat_id: str, scope: str = "") -> None:
-    """scope：发布范围——空=把所有「待发布」都发；指定(如 前端/web、后端/server)=只发对应模块。
-    单仓时 scope 无意义（就一个服务）、忽略。"""
+    """先做【配置完整性闸】(jkit 装没 + 涉及模块有没有 job)：齐了才发、缺了精确告诉去配。
+    路由不靠「所属模块」——按 branch_slug 拼分支、逐仓查它在哪个仓远程(worker 改了哪些仓就推了哪些)。
+    scope：空=全发；指定(前端/web、后端/server)=只发对应模块(多仓时)。"""
     cc = config.chat_config(chat_id)
     if not cc or cc.get("role") != "fix-bug":
         print("chat %s 未配置为 fix-bug 群" % chat_id, flush=True)
@@ -185,102 +223,80 @@ async def run_publish(chat_id: str, scope: str = "") -> None:
     if not (base_token and table_id and repos):
         print("emmy.yaml 缺 base/repos", flush=True)
         return
-    if not jobs:
-        await worker._send_group(chat_id, "想发布但还没配 Jenkins（jkit）——群主在初始化里把 jkit 装上、"
-                                 "告诉我各项目的 job 名,我才能自动发哈 🦊")
-        return
     _ok, listing = await worker._lark_json(worker.build_list_cmd(base_token, table_id))
     pend = pending_publish(listing or {})
     if not pend:
         await worker._send_group(chat_id, "现在没有「待发布」的活儿哈~ 等修复完的我再发 🦊")
         return
 
-    # 发布范围：多仓时按 scope 过滤（只发指定服务）；单仓时 scope 无意义，全发
-    apply_scope = bool(scope) and len(repos) > 1
-
-    # 按 repo 分组（按「所属模块」路由），认不出模块的单列、不在范围的跳过
-    groups, unrouted, skipped = {}, [], []
-    for rec in pend:
-        module = (rec.get("fields") or {}).get("所属模块", "")
-        rp = worker._pick_repo(repos, module)
-        if not rp:
-            unrouted.append(rec)
-            continue
-        if apply_scope and not _scope_match(module, scope):
-            skipped.append(rec)
-            continue
-        groups.setdefault(rp, {"module": module, "records": []})["records"].append(rec)
-    if apply_scope and not groups:
-        await worker._send_group(chat_id, "没找到属于「%s」的待发布记录哈~（其余待发布的没动）" % scope)
+    # 定位所有仓（路径不对是配置问题，直接报）
+    located, bad = {}, []
+    for module, path in repos.items():
+        loc = repo_locate.locate(path)
+        (located.__setitem__(module, {"path": path, "top": loc["toplevel"]}) if loc else bad.append("%s=%s" % (module, path)))
+    if bad:
+        await worker._send_group(chat_id, "这些仓路径不对、没法发布（群主核下 emmy.yaml 的 repos）：%s" % "、".join(bad))
         return
 
-    published = []   # 成功发布并已转「待验收」的编号
-    for rp, g in groups.items():
-        recs, module = g["records"], g["module"]
-        # 编号 → 记录映射：显式建（不要字典推导），挡住「缺编号(?)互相覆盖」与「非法编号注入」两种坑
-        by_num, invalid, dup = {}, [], []
-        for r in recs:
-            num = worker._field(r["fields"])["编号"]
-            if not worker.is_safe_num(num):     # 缺编号(?)/含非法字符 → 不拿去拼分支
-                invalid.append(r["record_id"])
-            elif num in by_num:                 # 同组编号重复 → 别被 dict 静默覆盖吞掉
-                dup.append(num)
-            else:
-                by_num[num] = r
-        if invalid:
-            await worker._send_group(chat_id, "这些记录编号缺失/非法、没法定位分支，没发布（群主补好「问题编号」再发）：%s"
-                                     % "、".join(invalid))
-        if dup:
-            await worker._send_group(chat_id, "这些编号在同模块里重复了，只处理了一条、其余跳过，核对下：%s" % "、".join("#" + d for d in dup))
-        if not by_num:
-            continue
-        branches = ["bugfix/%s" % n for n in by_num]
-        job = _jenkins_job(cc, module)
-        if not job:
-            await worker._send_group(chat_id, "这些(模块=%s)还没配 Jenkins job 名,没法自动构建,群主补一下~ %s"
-                                     % (module or "(空)", _nums(branches)))
-            continue
-        # 1) 合并进 dev
-        mr = merge_branches_to_dev(rp, branches)
-        if mr.get("missing"):   # 远程没有的分支（没推过/编号错）≠ 冲突，单独说清
-            await worker._send_group(chat_id, "这些分支远程不存在/没推过、跳过（不是冲突，确认下是否真修过/真推过）：%s" % _nums(mr["missing"]))
+    # 发布范围：多仓时按 scope 过滤模块
+    apply_scope = bool(scope) and len(located) > 1
+    modules = [m for m in located if not (apply_scope and not _scope_match(m, scope))]
+    if apply_scope and not modules:
+        await worker._send_group(chat_id, "没找到属于「%s」的仓哈~（其余待发布的没动）" % scope)
+        return
+
+    # 路由：逐仓查分支是否在远程（worker 改了哪些仓就推了哪些）
+    def _exists(m, branch):
+        return repo_locate.branch_on_remote(located[m]["top"], branch)
+    routed = _route_by_branches(pend, modules, _exists)
+    if not routed:
+        nums = _nums(["bugfix/" + worker.branch_slug(worker._field(r["fields"])["编号"]) for r in pend])
+        await worker._send_group(chat_id, "这些「待发布」的，我在仓里没找到对应的 bugfix 分支（没真推过？编号对不上？）：%s" % nums)
+        return
+
+    # ★ 配置完整性闸（B）：齐了才发，缺了精确告诉去配——不再半路崩/假通
+    gaps = _config_gaps(list(routed), jobs, shutil.which("jkit") is not None)
+    if gaps:
+        await worker._send_group(chat_id, "发布前还差点配置，配好再喊我发哈：\n%s" % "\n".join("· " + g for g in gaps))
+        return
+
+    # 逐仓：合进 dev → jkit 构建该仓 job → 转待验收
+    published = []
+    for module in routed:
+        items = routed[module]                                   # [(branch, rec)]
+        branches = list(dict.fromkeys(b for b, _r in items))     # 去重保序（同编号别合两次）
+        mr = merge_branches_to_dev(located[module]["path"], branches)
         if mr["conflicts"]:
-            await worker._send_group(chat_id, "这些合到 dev 有冲突、得人工处理（其余继续）：%s" % _nums(mr["conflicts"]))
+            await worker._send_group(chat_id, "[%s] 这些合 dev 有冲突、得人工处理（其余继续）：%s" % (module, _nums(mr["conflicts"])))
         if not mr["merged"]:
-            if mr.get("error"):
-                await worker._send_group(chat_id, mr["error"])
+            await worker._send_group(chat_id, mr.get("error") or ("[%s] 没有能合进 dev 的分支" % module))
             continue
         if not mr["pushed"]:
-            await worker._send_group(chat_id, mr["error"] or "推 dev 没成,稍后重试")
+            await worker._send_group(chat_id, mr.get("error") or ("[%s] 推 dev 没成，稍后重试" % module))
             continue
-        # 2) jkit 构建 dev
+        job = _jenkins_job(cc, module, sole=len(routed) == 1)    # 闸已保证有
         ok, out = await jenkins_build(job)
-        if out == "__NO_JKIT__":
-            await worker._send_group(chat_id, "这台机器没装/没配 jkit,发布跑不了——群主去初始化里把 jkit 配上 🦊")
-            break   # 后续 group 也只会同样报没 jkit；break 而非 return，好让下面把已发布的收尾通知发完
-        merged_nums = [b.split("/")[-1] for b in mr["merged"]]
+        if out == "__NO_JKIT__":                                 # 闸理论上挡过了，纯兜底
+            await worker._send_group(chat_id, "这台机器没装/没配 jkit，发布跑不了 🦊")
+            break
+        merged = set(mr["merged"])
+        ok_recs = [r for b, r in items if b in merged]
         if ok:
-            rids = [by_num[n]["record_id"] for n in merged_nums if n in by_num]
+            rids = [r["record_id"] for r in ok_recs]
             wok, _ = await worker._lark_json(worker.build_update_cmd(base_token, table_id, rids,
                                                                      {worker.STATUS_FIELD: _DEPLOYED_STATUS}))
             if wok:
-                published += merged_nums
-            else:   # 构建过了但表没写进去：别报假成功，告知人工兜底（表里仍「待发布」，下次 publish 会幂等重试）
-                await worker._send_group(chat_id, "⚠️ %s 构建通过、但回写表状态失败（表里还是「待发布」）——"
-                                         "群主手动改成「待验收」或稍后再喊我发一次：%s" % (module or job, _nums(branches)))
+                published += [worker._field(r["fields"])["编号"] for r in ok_recs]
+            else:   # 构建过了但表没写进去：别报假成功，告知人工兜底（表里仍「待发布」，下次幂等重试）
+                await worker._send_group(chat_id, "⚠️ [%s] 构建通过、但回写表状态失败（仍「待发布」）——"
+                                         "群主手动改「待验收」或稍后再喊我发一次：%s" % (module, _nums(branches)))
         else:
             tip = "构建超时" if out == "__TIMEOUT__" else _tail(await jenkins_diagnose(job), 400)
-            await worker._send_group(chat_id, "❌ %s 部署没成（dev 构建失败）：\n%s" % (module or job, tip))
+            await worker._send_group(chat_id, "❌ [%s] dev 构建失败：\n%s" % (module, tip))
 
-    # 收尾通知（不 @人）
     if published:
-        await worker._send_group(chat_id, "✅ 已发布到 DEV、构建通过~ 这些可以验收了：%s 🛠️" % _nums(["bugfix/" + n for n in published]))
-    if skipped:   # 按指定范围发的，范围外的待发布没动，说一声
-        await worker._send_group(chat_id, "（你说只发「%s」，所以这些待发布的这次没动：%s，要发也喊我~）"
-                                 % (scope, _nums(["bugfix/" + worker._field(r["fields"])["编号"] for r in skipped])))
-    if unrouted:
-        await worker._send_group(chat_id, "这些没认出所属模块、没法路由发布,群主标下模块再发：%s"
-                                 % _nums(["bugfix/" + worker._field(r["fields"])["编号"] for r in unrouted]))
+        await worker._send_group(chat_id, "✅ 已合进 DEV、构建通过~ 这些可以验收了：%s 🛠️"
+                                 % "、".join("#" + n for n in dict.fromkeys(published)))
 
 
 # ---------------- 自测（python core/publish.py --selftest）----------------
@@ -296,13 +312,14 @@ def _selftest() -> None:
     assert pending_publish({}) == []
     print("✓ pending_publish 只挑「待发布」")
 
-    # 2) _jenkins_job：单 job 直接用 / 多 job 按模块匹配 / 匹配不出 None
-    assert _jenkins_job({"jenkins_jobs": {"前端": "web-dev"}}, "随便") == "web-dev"     # 单个直接用
+    # 2) _jenkins_job：唯一模块+唯一 job 才兜底直接用；否则严格按模块匹配（多模块不拿单 job 顶替别人）
+    assert _jenkins_job({"jenkins_jobs": {"前端": "web-dev"}}, "随便", sole=True) == "web-dev"   # 唯一→直接用
+    assert _jenkins_job({"jenkins_jobs": {"前端": "web-dev"}}, "随便") is None                   # 非 sole→严格→不匹配
     cc = {"jenkins_jobs": {"前端": "web-dev", "后端": "srv-dev"}}
     assert _jenkins_job(cc, "前端门户") == "web-dev" and _jenkins_job(cc, "后端服务") == "srv-dev"
-    assert _jenkins_job(cc, "数据库") is None                                          # 匹配不出
+    assert _jenkins_job(cc, "数据库") is None and _jenkins_job(cc, "随便", sole=True) is None     # 多 job 即使 sole 也严格
     assert _jenkins_job({}, "x") is None                                              # 没配
-    print("✓ _jenkins_job 模块→job 路由（单个/匹配/匹配不出）")
+    print("✓ _jenkins_job 模块→job（唯一兜底/多 job 严格匹配/匹配不出）")
 
     # 3) _scope_match：发布范围过滤（空=全发；同义词；空模块+指定范围不误发）
     assert _scope_match("前端门户", "") is True            # 没指定范围 → 都发
@@ -318,6 +335,25 @@ def _selftest() -> None:
     assert _nums(["bugfix/0024", "bugfix/0007"]) == "#0024、#0007"
     assert _tail("x" * 600, 400) == "x" * 400 and _tail("abc", 400) == "abc"
     print("✓ _nums / _tail")
+
+    # 5) _route_by_branches：按 branch_slug 拼分支 + 逐仓按"分支是否存在"路由（不靠所属模块）
+    pend2 = [{"record_id": "r1", "fields": {"问题编号": "NO.001"}},
+             {"record_id": "r2", "fields": {"问题编号": "0007"}}]
+    def fake_exists(m, branch):   # NO.001→NO_001 在服务端、0007 在前端（模拟 worker 改了哪些仓就推了哪些）
+        return (m == "服务端" and branch == "bugfix/NO_001") or (m == "前端" and branch == "bugfix/0007")
+    routed = _route_by_branches(pend2, ["前端", "服务端"], fake_exists)
+    assert set(routed) == {"前端", "服务端"}, routed
+    assert routed["服务端"][0][0] == "bugfix/NO_001" and routed["服务端"][0][1]["record_id"] == "r1"
+    assert routed["前端"][0][0] == "bugfix/0007"
+    assert _route_by_branches(pend2, ["前端", "服务端"], lambda m, b: False) == {}   # 哪个仓都没这分支→空
+    print("✓ _route_by_branches：branch_slug(NO.001→NO_001) + 逐仓按分支存在路由")
+
+    # 6) _config_gaps：jkit 没装 / 模块缺 job → 精确报缺；齐了→空（这就是"完整即发、不完整让用户配"的闸）
+    g = _config_gaps(["前端", "服务端"], {"前端": "j1"}, jkit_present=True)
+    assert any("服务端" in x and "job" in x for x in g) and not any("前端" in x for x in g), g  # 只服务端缺 job
+    assert any("jkit" in x for x in _config_gaps(["前端"], {"前端": "j1"}, jkit_present=False))  # 没装 jkit
+    assert _config_gaps(["前端"], {"前端": "j1"}, jkit_present=True) == []                       # 配置完整→放行
+    print("✓ _config_gaps：缺 jkit/缺 job 精确报、配置齐了放行")
 
     print("\npublish 纯逻辑自测通过 ✅（合并 dev + jkit 构建需真环境，配好 jkit 后端到端测）")
 
