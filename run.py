@@ -78,20 +78,27 @@ def load_system_prompt(include_abilities: bool = True) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def _with_chat_context(chat_id: str, content: str) -> str:
-    """注入当前群的配置上下文（角色/表/repo），Emmy 据此认群、认活。没配该群则原样返回。"""
+def _with_chat_context(chat_id: str, content: str, sender_id: str = "") -> str:
+    """注入当前群的配置上下文（角色/表/repo/发言人），Emmy 据此认群、认活、认人。
+    发言人 open_id：event 不带姓名，只给 open_id——Emmy 据此用 `im chat.members get
+    --member-id-type open_id` 反查姓名（别问对方"你是谁"，这信息框架已经给了）。
+    没配该群则只在有 sender_id 时补一行，其余原样返回。"""
     cc = config.chat_config(chat_id)
-    if not cc:
+    lines = []
+    if cc:
+        lines.append("[当前群上下文]")
+        if cc.get("role"):
+            lines.append("- 群角色: %s" % cc["role"])
+        if cc.get("base_app_token"):
+            lines.append("- BUG表 base-token: %s  table-id: %s"
+                         % (cc["base_app_token"], cc.get("base_table_id", "")))
+        repos = cc.get("repos") or ({"默认": cc.get("repo")} if cc.get("repo") else {})
+        if repos:
+            lines.append("- 项目仓库: %s" % "，".join("%s=%s" % (n, p) for n, p in repos.items()))
+    if sender_id:
+        lines.append("- 这条消息的发言人 open_id: %s（要知道是谁本人报的活，用群成员列表反查姓名，别直接问对方是谁）" % sender_id)
+    if not lines:
         return content
-    lines = ["[当前群上下文]"]
-    if cc.get("role"):
-        lines.append("- 群角色: %s" % cc["role"])
-    if cc.get("base_app_token"):
-        lines.append("- BUG表 base-token: %s  table-id: %s"
-                     % (cc["base_app_token"], cc.get("base_table_id", "")))
-    repos = cc.get("repos") or ({"默认": cc.get("repo")} if cc.get("repo") else {})
-    if repos:
-        lines.append("- 项目仓库: %s" % "，".join("%s=%s" % (n, p) for n, p in repos.items()))
     return "\n".join(lines) + "\n\n" + content
 
 
@@ -311,7 +318,7 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
 
     # 群聊：入群初始化闸（没初始化过 → onboarding 自检引导；初始化完成 → 注入群上下文正常干活）
     inited = _is_initialized(cc)
-    prompt = _with_chat_context(chat_id, content) if inited else _onboard_prompt(chat_id, content)
+    prompt = _with_chat_context(chat_id, content, sender_id) if inited else _onboard_prompt(chat_id, content)
     res = await claude_runner.run(
         prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR, sender_id=sender_id)
     if res["is_error"]:
