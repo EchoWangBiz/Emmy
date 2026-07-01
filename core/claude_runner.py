@@ -55,7 +55,7 @@ def build_cmd(
     *,
     resume: bool,
     system_prompt: str = "",
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-sonnet-5",
     allowed_tools: str = "Bash(emmy-lark:*)",
 ) -> List[str]:
     """构造 claude -p 命令（纯函数，便于单测）。"""
