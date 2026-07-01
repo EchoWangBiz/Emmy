@@ -177,7 +177,7 @@ async def _deploy_dev_via_skill(repo_top: str, timeout: int = 900) -> tuple:
         "  DEPLOYED: FAILURE | <关键错误>")
     cmd = ["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "default",
            "--allowedTools", DEPLOY_ALLOWED, "--disallowedTools", *DEPLOY_DISALLOWED,
-           "--model", "claude-sonnet-4-6", "--strict-mcp-config"]
+           "--model", "claude-sonnet-5", "--strict-mcp-config"]
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, cwd=wt, stdout=PIPE, stderr=PIPE)

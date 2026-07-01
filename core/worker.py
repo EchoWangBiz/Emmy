@@ -361,7 +361,7 @@ async def _run_claude(prompt: str, cwd: str, timeout: int = 1080) -> dict:
            "--permission-mode", "default",
            "--allowedTools", WORKER_ALLOWED,
            "--disallowedTools", *WORKER_DISALLOWED,
-           "--model", "claude-sonnet-4-6", "--strict-mcp-config"]
+           "--model", "claude-sonnet-5", "--strict-mcp-config"]
     proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, stdout=PIPE, stderr=PIPE)
     try:
         out, _err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
