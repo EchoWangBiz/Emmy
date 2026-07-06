@@ -643,6 +643,7 @@ async def run_worker(chat_id: str) -> list:
 
 async def check_ready(chat_id: str) -> None:
     """端到端测试前的就绪自检：配置 / repo / dev分支 / claude / gh / 待修复数。"""
+    import shutil
     import subprocess
     print("🔎 worker 就绪自检 — chat %s\n" % chat_id)
     ok = True
@@ -674,20 +675,32 @@ async def check_ready(chat_id: str) -> None:
         else:
             print("  ✗ [%s] 没有 dev 分支（worker 从 dev 切子分支）" % name); ok = False
 
-    cp = subprocess.run(["claude", "-p", "ok", "--output-format", "json"],
-                        capture_output=True, text=True)
-    if '"is_error":false' in cp.stdout.replace(" ", ""):
-        print("  ✓ claude 登录可用")
+    if shutil.which("claude"):
+        cp = subprocess.run(["claude", "-p", "ok", "--output-format", "json"],
+                            capture_output=True, text=True)
+        if '"is_error":false' in cp.stdout.replace(" ", ""):
+            print("  ✓ claude 登录可用")
+        else:
+            print("  ✗ claude 未登录（claude / claude setup-token）"); ok = False
     else:
-        print("  ✗ claude 未登录（claude / claude setup-token）"); ok = False
+        print("  ✗ claude 命令不存在（worker 当前仍用 Claude Code 改代码）"); ok = False
 
-    gh = subprocess.run(["gh", "auth", "status"], capture_output=True)
-    print("  ✓ gh 已认证" if gh.returncode == 0 else "  ✗ gh 未认证（gh auth login，提 PR 用）")
-    ok = ok and gh.returncode == 0
+    if shutil.which("gh"):
+        gh = subprocess.run(["gh", "auth", "status"], capture_output=True)
+        print("  ✓ gh 已认证" if gh.returncode == 0 else "  ✗ gh 未认证（gh auth login，提 PR 用）")
+        ok = ok and gh.returncode == 0
+    else:
+        print("  ✗ gh 命令不存在（提 PR/MR 用；GitLab 项目也需要对应 CLI 或后续适配）")
+        ok = False
 
     if not miss:
-        pend = await read_pending(cc["base_app_token"], cc["base_table_id"])
-        print("  ✓ 待修复 %d 条" % len(pend))
+        ok_list, listing = await _lark_json(build_list_cmd(cc["base_app_token"], cc["base_table_id"]))
+        if ok_list:
+            pend = pending_records(listing or {})
+            print("  ✓ 待修复 %d 条" % len(pend))
+        else:
+            print("  ✗ BUG 表记录读取失败（通常缺 base:record:read，worker 扫表需要它）")
+            ok = False
 
     print("\n%s" % (("✅ 就绪！可以 python core/worker.py %s 真跑了" % chat_id)
                     if ok else "⚠️ 上面有 ✗，处理后再跑"))
