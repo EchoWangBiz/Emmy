@@ -360,8 +360,9 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         fwd_text = await attachments.gather_forwarded(fwd_ids)
         if fwd_text:
             content = (content + "\n\n" + fwd_text).strip()
-    # 回复上下文：若这条是「回复」别人某条消息，补上被回复的原消息（让 Emmy 看懂指代）
-    if reply_ids and (is_p2p or cc is not None):
+    # 回复上下文：若这条是「回复」别人某条消息，补上被回复的原消息（让 Emmy 看懂指代）。
+    # onboarding 也必须读：用户常回复上一条“表/仓库我都给了”的消息说“再看下”，不读就只剩这三个字。
+    if reply_ids:
         reply_text = await attachments.gather_reply_context(reply_ids)
         if reply_text:
             content = (content + "\n\n" + reply_text).strip()
