@@ -4,17 +4,18 @@ run.py —— Emmy 主进程
 
 主链路：
   lark-cli event consume (listener) → 防抖聚合 → ChatDispatcher (按群分发)
-    → claude_runner.run (大脑干活) → reply.send (发回原会话)
+    → brain.run (大脑适配器干活) → reply.send (发回原会话)
 
 并发模型：同一个群【串行】（保 session 不被并发写坏），不同群【并行】，全局 Semaphore 限并发上限。
 
 ⚠️ 端到端跑通需要两个前提：
-  ① 本机 claude 已登录（claude / claude setup-token）—— 否则 claude_runner 报未登录
+  ① 本机所选大脑已登录（默认 claude；也可 --brain codex）
   ② 飞书 app 已配好能收 @消息（机器人能力 + 订阅 im.message.receive_v1 + 长连接 + 发布 + 拉群）
 """
 from __future__ import annotations
 
 import asyncio
+import argparse
 import fcntl
 import json
 import os
@@ -25,7 +26,7 @@ import time
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from core import listener, claude_runner, reply, config, attachments  # noqa: E402
+from core import listener, brain, reply, config, attachments  # noqa: E402
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 SYSTEM_PROMPT_FILE = os.path.join(PROJECT_DIR, "prompts", "emmy_system.md")
@@ -302,14 +303,14 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
         await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"), at_user_id=at)
         return
 
-    # 续聊判定按「群+发言人」：同群不同人各自独立 session（claude_runner 也按发言人派生 session_id）
+    # 续聊判定按「群+发言人」：同群不同人各自独立 session（brain 适配器也按发言人派生 session_id）
     conv = _conv_key(msg)
     resume = conv in _seen_chats
     _seen_chats.add(conv)
 
     # 私聊（p2p）：正常跟 Claude Code 对话——精简 system prompt（不带群里的 BUG 能力）+ 私聊定位
     if is_p2p:
-        res = await claude_runner.run(
+        res = await brain.run(
             P2P_PREFIX + content, chat_id, resume=resume,
             system_prompt=system_prompt_p2p, cwd=PROJECT_DIR, sender_id=sender_id)
         text = _diagnose(res) if res["is_error"] else (res["text"] or "（没有返回内容）")
@@ -319,7 +320,7 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     # 群聊：入群初始化闸（没初始化过 → onboarding 自检引导；初始化完成 → 注入群上下文正常干活）
     inited = _is_initialized(cc)
     prompt = _with_chat_context(chat_id, content, sender_id) if inited else _onboard_prompt(chat_id, content)
-    res = await claude_runner.run(
+    res = await brain.run(
         prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR, sender_id=sender_id)
     if res["is_error"]:
         text = _diagnose(res)
@@ -530,7 +531,17 @@ def _acquire_single_instance_lock(path: Optional[str] = None):
     return fh
 
 
-async def main() -> None:
+def parse_args(argv: Optional[list] = None):
+    p = argparse.ArgumentParser(description="Emmy 飞书智能体")
+    p.add_argument("--brain", choices=brain.SUPPORTED,
+                   help="选择大脑适配器：claude 或 codex。默认读取 EMMY_BRAIN / emmy.yaml defaults.brain / claude")
+    p.add_argument("--model", help="覆盖本次启动使用的模型。默认读取 EMMY_MODEL / emmy.yaml defaults")
+    return p.parse_args(argv)
+
+
+async def main(args=None) -> None:
+    args = args or parse_args()
+    provider, model = brain.configure(args.brain, args.model)
     system_prompt = load_system_prompt()                            # 群聊：人设 + 全部能力
     system_prompt_p2p = load_system_prompt(include_abilities=False)  # 私聊：仅人设，纯 CC 对话
 
@@ -541,7 +552,8 @@ async def main() -> None:
     async def on_message(msg: dict) -> None:
         debouncer.feed(msg)
 
-    print("🦊 Emmy 启动，开始监听飞书 @消息…", flush=True)
+    model_tip = (" model=%s" % model) if model else ""
+    print("🦊 Emmy 启动，开始监听飞书 @消息… brain=%s%s" % (provider, model_tip), flush=True)
     # H6 supervisor：event consume 断开/异常就重启
     while True:
         try:
@@ -554,12 +566,13 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    _ARGS = parse_args()
     # 单实例闸：已有监听器在跑就别再起第二个（两个会重复处理每条消息、重复派工）
     if _acquire_single_instance_lock() is None:
         print("⚠️ 已经有一个 Emmy 监听器在跑了（~/.emmy/run.lock 被占用），本次不启动。", flush=True)
         print("   想重启的话：先停掉在跑的那个（launchd 用 ./start.sh stop；前台的 Ctrl-C 或 kill 掉），再起一个。", flush=True)
         sys.exit(1)
     try:
-        asyncio.run(main())
+        asyncio.run(main(_ARGS))
     except KeyboardInterrupt:
         print("\nEmmy 已停止")

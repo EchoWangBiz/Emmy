@@ -57,6 +57,16 @@ git clone <repo> && cd emmy
 ./start.sh start    # 安装 launchd 后台守护，登录即自动运行、崩溃自愈
 ```
 
+可选：启动时选择大脑适配器（默认 `claude`）：
+
+```bash
+./start.sh fg --brain claude
+./start.sh fg --brain codex
+./start.sh start --brain codex --model gpt-5.4
+```
+
+也可以写进 `emmy.yaml` 的 `defaults.brain / defaults.claude_model / defaults.codex_model`。
+
 > 子命令一览：`fg`（前台）· `start`（后台常驻）· `stop` · `restart` · `status` · `logs`。
 
 起来之后，**把机器人拉进群，@它 发消息**。

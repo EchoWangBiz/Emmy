@@ -136,12 +136,14 @@ def _selftest() -> None:
         "    base_table_id: tbl_x\n"
         "    repo: /Users/echo/project/mass   # 本地路径\n"
         "defaults:\n"
-        "  model: claude-sonnet-5\n"
+        "  brain: claude\n"
+        "  claude_model: claude-sonnet-5\n"
     )
     cfg = _parse(sample)
     assert cfg["chats"]["oc_abc"]["role"] == "fix-bug", cfg
     assert cfg["chats"]["oc_abc"]["repo"] == "/Users/echo/project/mass", cfg
-    assert cfg["defaults"]["model"] == "claude-sonnet-5"
+    assert cfg["defaults"]["brain"] == "claude"
+    assert cfg["defaults"]["claude_model"] == "claude-sonnet-5"
     print("✓ 解析嵌套 + 标量 + 行内注释")
 
     cc = chat_config("oc_abc", cfg)

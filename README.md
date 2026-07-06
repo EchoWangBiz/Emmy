@@ -231,6 +231,11 @@ git clone https://github.com/EchoWangBiz/Emmy.git emmy && cd emmy
 # ③ 起 Emmy（端到端跑通需先：claude 登录 + 飞书 app 配好收消息）
 ./start.sh fg      # 前台调试，看实时日志、Ctrl-C 退出
 # 或 ./start.sh start   # launchd 后台常驻、开机自启
+
+# 可选：启动时选择大脑适配器
+./start.sh fg --brain claude
+./start.sh fg --brain codex
+./start.sh start --brain codex --model gpt-5.4
 ```
 
 > 起来后把机器人拉进群、@它即可。**新群**首次 @ 会触发「配置门禁」——Emmy 会对话式带你把这个群配好（干啥 / BUG 表链接 / 代码仓库路径），配好自动写进 `emmy.yaml`，以后不再问。
