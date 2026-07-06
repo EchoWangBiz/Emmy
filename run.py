@@ -353,9 +353,14 @@ async def _spawn_worker(registry: dict, chat_id: str, script: str, log_prefix: s
         os.makedirs(WORKER_LOG_DIR, exist_ok=True)
         log_path = os.path.join(WORKER_LOG_DIR, "%s-%s.log" % (log_prefix, chat_id))
         logf = open(log_path, "a", buffering=1)  # 行缓冲，tail 能实时看到
+        proc_env = dict(os.environ)
+        provider, model = brain.current()
+        proc_env["EMMY_BRAIN"] = provider
+        if model:
+            proc_env["EMMY_MODEL"] = model
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-u", os.path.join(PROJECT_DIR, "core", script), chat_id, *(extra or []),
-            cwd=PROJECT_DIR, stdout=logf, stderr=logf)  # -u：无缓冲，日志实时滚
+            cwd=PROJECT_DIR, env=proc_env, stdout=logf, stderr=logf)  # -u：无缓冲，日志实时滚
         registry[chat_id] = (proc, logf)
         asyncio.create_task(_reap_worker(registry, chat_id, proc, logf, log_prefix))
         print(f"[run] {emoji} 已为 {chat_id} 起 {log_prefix}（pid={proc.pid}），日志: {log_path}", flush=True)
