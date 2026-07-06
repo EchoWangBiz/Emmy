@@ -111,6 +111,10 @@ _CONFIG_RE = re.compile(r"<EMMY_CONFIG>\s*(\{.*?\})\s*</EMMY_CONFIG>", re.S)
 _ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo", "repos",
                  "jenkins_jobs", "initialized")
 _URL_RE = re.compile(r"https?://[^\s<>'\"`]+")
+_REPO_RE = re.compile(
+    r"(?P<label>前端|后端|服务端|客户端|web|frontend|backend|repo|默认)?\s*"
+    r"[:=：＝]\s*[`'\"]?(?P<path>/Users/[^\s`'\"，,；;）)]+)"
+)
 
 
 def _base_binding_from_url(url: str) -> Optional[dict]:
@@ -156,10 +160,10 @@ async def _resolve_wiki_base_url(url: str) -> Optional[dict]:
             "source": "wiki-url", "wiki_node_token": data.get("node_token", "")}
 
 
-async def _annotate_base_links(content: str) -> str:
-    """把消息里可识别的 Base/Wiki-Base 链接解析结果作为框架可信上下文注入给大脑。"""
+async def _base_bindings_from_content(content: str) -> list:
+    """提取消息里可识别的 Base/Wiki-Base 绑定。"""
     if not content:
-        return content
+        return []
     found = []
     for url in _URL_RE.findall(content):
         direct = _base_binding_from_url(url)
@@ -169,6 +173,11 @@ async def _annotate_base_links(content: str) -> str:
         via_wiki = await _resolve_wiki_base_url(url)
         if via_wiki:
             found.append(via_wiki)
+    return found
+
+
+def _annotate_base_links(content: str, found: list) -> str:
+    """把可识别的 Base/Wiki-Base 链接解析结果作为框架可信上下文注入给大脑。"""
     if not found:
         return content
     lines = ["【框架已解析到 BUG 多维表格链接，直接使用这些值，不要再说链接格式不对】"]
@@ -177,6 +186,43 @@ async def _annotate_base_links(content: str) -> str:
             item["base_app_token"], item["base_table_id"], item["source"],
             ", wiki_node_token=%s" % item["wiki_node_token"] if item.get("wiki_node_token") else ""))
     return content + "\n\n" + "\n".join(lines)
+
+
+def _repos_from_content(content: str) -> dict:
+    """从 onboarding 对话里提取“前端=/Users/...”这类本地仓库路径，作为部分配置记忆。"""
+    repos = {}
+    for m in _REPO_RE.finditer(content or ""):
+        path = m.group("path").rstrip(".。")
+        if not path.startswith("/Users/"):
+            continue
+        label = (m.group("label") or "默认").strip()
+        label = {"frontend": "前端", "web": "前端", "backend": "后端", "repo": "默认"}.get(label, label)
+        repos[label] = path
+    return repos
+
+
+def _remember_onboarding_facts(chat_id: str, base_bindings: list, repos: dict, content: str) -> None:
+    """把已确定的 onboarding 事实先落盘为 partial config，避免大脑口头“记住”但框架没记住。"""
+    patch = {}
+    old = config.chat_config(chat_id) or {}
+    if "bug" in (content or "").lower() or "修 BUG" in (content or "") or "BUG表" in (content or ""):
+        patch["role"] = "fix-bug"
+    if base_bindings:
+        first = base_bindings[0]
+        patch["base_app_token"] = first.get("base_app_token")
+        patch["base_table_id"] = first.get("base_table_id")
+    if repos:
+        merged_repos = dict(old.get("repos") or ({"默认": old.get("repo")} if old.get("repo") else {}))
+        merged_repos.update(repos)
+        patch["repos"] = merged_repos
+    patch = {k: v for k, v in patch.items() if v}
+    if not patch:
+        return
+    try:
+        path = config.set_chat_config(chat_id, patch)
+        print(f"[run] ✓ 已暂存群配置片段 {chat_id} -> {path}: {patch}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[run] ⚠️ 暂存群配置片段失败: {e}", flush=True)
 
 
 def _is_initialized(cc: dict) -> bool:
@@ -392,7 +438,10 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     # 群聊：入群初始化闸（没初始化过 → onboarding 自检引导；初始化完成 → 注入群上下文正常干活）
     inited = _is_initialized(cc)
     if not inited:
-        content = await _annotate_base_links(content)
+        base_bindings = await _base_bindings_from_content(content)
+        repos = _repos_from_content(content)
+        _remember_onboarding_facts(chat_id, base_bindings, repos, content)
+        content = _annotate_base_links(content, base_bindings)
     prompt = _with_chat_context(chat_id, content, sender_id) if inited else _onboard_prompt(chat_id, content)
     res = await brain.run(
         prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR, sender_id=sender_id)
