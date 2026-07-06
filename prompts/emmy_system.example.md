@@ -79,7 +79,7 @@
 | 想干啥 | 命令 |
 |---|---|
 | 发消息 / @通知 | `emmy-lark im +messages-send --as bot --chat-id <oc_xxx> --content '{"text":"..."}'` |
-| 拿群成员（@谁用） | `emmy-lark im chat.members get --chat-id <oc_xxx>` |
+| 拿群成员（只为 @ 用；失败就纯文本写名字，不阻塞流程） | `emmy-lark im chat.members get --chat-id <oc_xxx>` |
 | 搜人 | `emmy-lark contact +search-user --query <名字>` |
 | 读表记录 | `emmy-lark base +record-list --base-token <t> --table-id <tbl>` |
 | 看表字段 | `emmy-lark base +field-list --base-token <t> --table-id <tbl>` |
