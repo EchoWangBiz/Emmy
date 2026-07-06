@@ -14,11 +14,22 @@ im.message.receive_v1 事件结构（本机 `lark-cli event schema` 确认）：
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections import OrderedDict
 from typing import Awaitable, Callable, Optional
 
 EVENT_KEY = "im.message.receive_v1"
+
+
+async def _drain_stderr(stream: Optional[asyncio.StreamReader]) -> None:
+    """Drain lark-cli stderr so the subprocess cannot block on a full pipe."""
+    if stream is None:
+        return
+    async for raw in stream:
+        line = raw.decode("utf-8", "replace").strip()
+        if line:
+            print(f"[listener:stderr] {line}", flush=True)
 
 
 class Dedup:
@@ -87,23 +98,41 @@ async def listen(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    if on_ready:
-        on_ready()
-    assert proc.stdout is not None
-    async for raw in proc.stdout:
-        event = parse_line(raw.decode("utf-8", "replace"))
-        if event is None:
-            continue
-        msg = to_message(event)
-        if msg is None:
-            continue
-        if not dedup.is_new(msg["event_id"]):
-            continue
-        try:
-            await on_message(msg)
-        except Exception as e:  # 单条处理失败不拖垮监听
-            print(f"[listener] on_message error: {e}", flush=True)
-    return await proc.wait()
+    stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
+    try:
+        if on_ready:
+            on_ready()
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            event = parse_line(raw.decode("utf-8", "replace"))
+            if event is None:
+                continue
+            msg = to_message(event)
+            if msg is None:
+                continue
+            if not dedup.is_new(msg["event_id"]):
+                continue
+            try:
+                await on_message(msg)
+            except Exception as e:  # 单条处理失败不拖垮监听
+                print(f"[listener] on_message error: {e}", flush=True)
+        return await proc.wait()
+    finally:
+        if proc.returncode is None:
+            if proc.stdin is not None:
+                with contextlib.suppress(Exception):
+                    proc.stdin.close()
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task
 
 
 # ---------------- 自测（python3 core/listener.py）----------------
