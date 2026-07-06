@@ -85,9 +85,12 @@ def build_cmd(
     model: str = "",
     sandbox: str = DEFAULT_SANDBOX,
     codex_path: str = "codex",
+    skip_git_repo_check: bool = False,
 ) -> List[str]:
     """构造 codex exec 命令（纯函数，便于单测）。"""
     cmd = [codex_path, "exec", "--sandbox", sandbox]
+    if skip_git_repo_check:
+        cmd += ["--skip-git-repo-check"]
     if cwd:
         cmd += ["--cd", cwd]
     if model and not thread_id:
@@ -100,6 +103,25 @@ def build_cmd(
     else:
         cmd += ["--json", prompt]
     return cmd
+
+
+def _text_from_content(value) -> str:
+    """Best-effort text extraction from Codex JSON event payloads."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            elif item is not None:
+                parts.append(str(item))
+        return "".join(parts)
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("content") or "")
+    return str(value)
 
 
 def parse_jsonl(stdout: str) -> dict:
@@ -118,12 +140,24 @@ def parse_jsonl(stdout: str) -> dict:
         if ev.get("type") == "thread.started":
             thread_id = ev.get("thread_id") or thread_id
         if ev.get("type") == "error":
-            error = ev.get("message") or ev.get("error") or "codex error"
+            e = ev.get("error")
+            if isinstance(e, dict):
+                error = e.get("message") or e.get("error") or json.dumps(e, ensure_ascii=False)
+            else:
+                error = ev.get("message") or e or "codex error"
         item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
-        if item.get("type") == "agent_message" and item.get("text") is not None:
-            last_text = item.get("text") or last_text
+        if item.get("type") in ("agent_message", "assistant_message", "message"):
+            text = _text_from_content(item.get("text") if item.get("text") is not None else item.get("content"))
+            last_text = text or last_text
+        if ev.get("type") in ("agent_message", "assistant_message", "message"):
+            text = _text_from_content(ev.get("text") if ev.get("text") is not None else ev.get("content"))
+            last_text = text or last_text
         if ev.get("type") == "turn.failed":
-            error = ev.get("error") or error or "codex turn failed"
+            e = ev.get("error")
+            if isinstance(e, dict):
+                error = e.get("message") or e.get("error") or json.dumps(e, ensure_ascii=False)
+            else:
+                error = e or error or "codex turn failed"
     return {
         "ok": not bool(error),
         "is_error": bool(error),
@@ -147,24 +181,31 @@ async def _invoke(
     if cwd:
         proc_env["PATH"] = os.path.join(cwd, "bin") + os.pathsep + proc_env.get("PATH", "")
     sandbox = proc_env.get("EMMY_CODEX_SANDBOX") or DEFAULT_SANDBOX
+    skip_git_repo_check = proc_env.get("EMMY_CODEX_SKIP_GIT_REPO_CHECK", "").lower() in ("1", "true", "yes")
     cmd = build_cmd(prompt, thread_id=thread_id, cwd=cwd, model=model,
-                    sandbox=sandbox, codex_path=codex_bin(proc_env))
+                    sandbox=sandbox, codex_path=codex_bin(proc_env),
+                    skip_git_repo_check=skip_git_repo_check)
     proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=proc_env, stdout=PIPE, stderr=PIPE)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         return {"ok": False, "is_error": True, "text": "（处理超时，请稍后再试）",
-                "error": "timeout", "session_id": thread_id, "cost_usd": 0.0, "raw_stderr": ""}
-    res = parse_jsonl(out.decode("utf-8", "replace"))
-    res["raw_stderr"] = (err.decode("utf-8", "replace")[:1500] if err else "")
+                "error": "timeout", "session_id": thread_id, "cost_usd": 0.0,
+                "raw_stderr": "", "raw_stdout_tail": ""}
+    stdout_text = out.decode("utf-8", "replace")
+    stderr_text = err.decode("utf-8", "replace") if err else ""
+    res = parse_jsonl(stdout_text)
+    res["raw_stdout_tail"] = stdout_text[-4000:]
+    res["raw_stderr"] = stderr_text[:1500]
+    res["raw_stderr_tail"] = stderr_text[-4000:]
     res["returncode"] = proc.returncode
     if proc.returncode != 0 and not res["is_error"]:
         res["ok"] = False
         res["is_error"] = True
         res["error"] = res["raw_stderr"] or "codex exited with rc=%s" % proc.returncode
     if res["is_error"]:
-        res["raw_stdout"] = out.decode("utf-8", "replace")[:1500]
+        res["raw_stdout"] = stdout_text[:1500]
     return res
 
 
@@ -228,6 +269,8 @@ def _selftest() -> None:
     assert cmd3[0] == "/x/codex"
     cmd4 = build_cmd("hi", sandbox="read-only")
     assert cmd4[3] == "read-only"
+    cmd5 = build_cmd("hi", skip_git_repo_check=True)
+    assert "--skip-git-repo-check" in cmd5
     assert codex_bin({"PATH": "/no/such/path"}) in ("codex", _CODEX_APP_BIN)
     print("✓ codex build_cmd 新建/续聊")
 
@@ -238,6 +281,10 @@ def _selftest() -> None:
     ])
     parsed = parse_jsonl(out)
     assert parsed["ok"] and parsed["text"] == "done" and parsed["session_id"] == "t1"
+    out2 = '{"type":"item.completed","item":{"type":"message","content":[{"type":"output_text","text":"done2"}]}}'
+    assert parse_jsonl(out2)["text"] == "done2"
+    out3 = '{"type":"message","content":[{"text":"done3"}]}'
+    assert parse_jsonl(out3)["text"] == "done3"
     err = parse_jsonl('{"type":"error","message":"bad"}')
     assert err["is_error"] and err["error"] == "bad"
     print("✓ codex JSONL 解析")
