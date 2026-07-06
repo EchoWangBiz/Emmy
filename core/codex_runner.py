@@ -6,9 +6,10 @@ core/codex_runner.py —— 调用本机 Codex CLI（可选大脑适配器）
 agent_message item 中取；thread_id 会按（chat_id + sender_id + system_prompt）
 记录到 ~/.emmy/codex_sessions.json，下次同会话用 `codex exec resume` 续聊。
 
-注意：Codex CLI 当前没有 Claude Code 那种 allowedTools 精确白名单。本适配器用
-read-only sandbox + prompt 约束 + PATH 优先指向 bin/emmy-lark，适合作为可选试验
-大脑；聊天侧的强门禁仍以 emmy-lark/lark_gate 为核心。
+注意：Codex CLI 当前没有 Claude Code 那种 allowedTools 精确白名单。飞书命令必须走
+bin/emmy-lark，真正的飞书操作安全边界由 emmy-lark/lark_gate 白名单负责。
+Codex 的 read-only/workspace-write sandbox 会让 lark-cli 子进程 DNS 失败，故默认用
+danger-full-access；如需排查可用 EMMY_CODEX_SANDBOX 覆盖。
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ PIPE = asyncio.subprocess.PIPE
 _NS = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
 _SESSION_FILE = os.path.expanduser("~/.emmy/codex_sessions.json")
 _CODEX_APP_BIN = "/Applications/Codex.app/Contents/Resources/codex"
+DEFAULT_SANDBOX = "danger-full-access"
 
 CODEX_SYSTEM_PREFIX = (
     "你是 Emmy 的大脑。你收到的最终回复会被框架自动发回当前飞书聊天。\n"
@@ -81,7 +83,7 @@ def build_cmd(
     thread_id: Optional[str] = None,
     cwd: Optional[str] = None,
     model: str = "",
-    sandbox: str = "read-only",
+    sandbox: str = DEFAULT_SANDBOX,
     codex_path: str = "codex",
 ) -> List[str]:
     """构造 codex exec 命令（纯函数，便于单测）。"""
@@ -144,8 +146,9 @@ async def _invoke(
     proc_env = dict(env or os.environ)
     if cwd:
         proc_env["PATH"] = os.path.join(cwd, "bin") + os.pathsep + proc_env.get("PATH", "")
+    sandbox = proc_env.get("EMMY_CODEX_SANDBOX") or DEFAULT_SANDBOX
     cmd = build_cmd(prompt, thread_id=thread_id, cwd=cwd, model=model,
-                    codex_path=codex_bin(proc_env))
+                    sandbox=sandbox, codex_path=codex_bin(proc_env))
     proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=proc_env, stdout=PIPE, stderr=PIPE)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -200,8 +203,9 @@ async def run(
 
 async def healthcheck() -> bool:
     path = codex_bin()
+    sandbox = os.environ.get("EMMY_CODEX_SANDBOX") or DEFAULT_SANDBOX
     proc = await asyncio.create_subprocess_exec(
-        path, "exec", "--json", "--sandbox", "read-only", "--skip-git-repo-check",
+        path, "exec", "--json", "--sandbox", sandbox, "--skip-git-repo-check",
         "Return exactly ok.", stdout=PIPE, stderr=PIPE)
     out, _ = await proc.communicate()
     return proc.returncode == 0 and not parse_jsonl(out.decode("utf-8", "replace"))["is_error"]
@@ -215,13 +219,15 @@ def _selftest() -> None:
     print("✓ codex session key 稳定派生")
 
     cmd = build_cmd("hi", cwd="/tmp/repo", model="gpt-5.4")
-    assert cmd[:4] == ["codex", "exec", "--sandbox", "read-only"]
+    assert cmd[:4] == ["codex", "exec", "--sandbox", DEFAULT_SANDBOX]
     assert "--cd" in cmd and "/tmp/repo" in cmd and "--model" in cmd and "--json" in cmd
     assert "resume" not in cmd
     cmd2 = build_cmd("again", thread_id="tid", cwd="/tmp/repo")
     assert "resume" in cmd2 and "tid" in cmd2 and "again" in cmd2
     cmd3 = build_cmd("hi", codex_path="/x/codex")
     assert cmd3[0] == "/x/codex"
+    cmd4 = build_cmd("hi", sandbox="read-only")
+    assert cmd4[3] == "read-only"
     assert codex_bin({"PATH": "/no/such/path"}) in ("codex", _CODEX_APP_BIN)
     print("✓ codex build_cmd 新建/续聊")
 
