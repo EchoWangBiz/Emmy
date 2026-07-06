@@ -66,6 +66,7 @@ git clone <repo> && cd emmy
 ```
 
 也可以写进 `emmy.yaml` 的 `defaults.brain / defaults.claude_model / defaults.codex_model`。
+Codex 大脑为了让 `emmy-lark` 能访问飞书接口，默认使用可联网的 `danger-full-access` sandbox；飞书操作仍由 `emmy-lark` 白名单门禁保护。
 
 > 子命令一览：`fg`（前台）· `start`（后台常驻）· `stop` · `restart` · `status` · `logs`。
 
