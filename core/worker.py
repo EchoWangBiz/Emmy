@@ -16,6 +16,7 @@ core/worker.py —— 修复 worker（代码侧 agent，独立进程）
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import sys
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core import claude_runner, config, repo_locate  # noqa: E402
+from core import brain, claude_runner, codex_runner, config, repo_locate  # noqa: E402
 
 PIPE = asyncio.subprocess.PIPE
 
@@ -32,6 +33,12 @@ WORKER_ALLOWED = ("Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(yarn:*) Bash(pnpm:*) 
                   "Bash(python3:*) Bash(node:*) Bash(ls:*) Bash(cat:*) Bash(grep:*) "
                   "Bash(rg:*) Bash(find:*) Bash(tail:*) Bash(head:*) Bash(wc:*) Edit Write Read")
 WORKER_DISALLOWED = ["Bash(rm:*)", "Bash(sudo:*)", "Bash(curl:*)", "Bash(ssh:*)", "Bash(git push origin dev:*)"]
+WORKER_CODEX_SYSTEM = (
+    "你是 Emmy 的代码修复 worker，运行在独立 git worktree 中。"
+    "严格按用户 prompt 的 DONE/BLOCKED 契约输出最后一行。"
+    "不要运行测试、构建、dev server 或长时间命令；只做最小必要修改、提交并推当前 bugfix 分支。"
+    "绝不 merge 到 dev/main，绝不删除无关文件。"
+)
 
 STATUS_FIELD = "状态"
 # worker 回写要用到的字段 + 状态选项；开工前校验这些齐不齐，缺了就别白跑一趟
@@ -373,6 +380,37 @@ async def _run_claude(prompt: str, cwd: str, timeout: int = 1080) -> dict:
     return claude_runner.parse_result(out.decode("utf-8", "replace"))
 
 
+def _worker_brain() -> tuple:
+    """Worker brain follows EMMY_WORKER_BRAIN, then the listener's EMMY_BRAIN, then config/default."""
+    provider = brain.resolve_provider(os.environ.get("EMMY_WORKER_BRAIN") or os.environ.get("EMMY_BRAIN"))
+    model = brain.resolve_model(provider, os.environ.get("EMMY_WORKER_MODEL") or os.environ.get("EMMY_MODEL"))
+    return provider, model
+
+
+async def _run_codex(prompt: str, cwd: str, timeout: int = 1080) -> dict:
+    provider, model = _worker_brain()
+    key = hashlib.sha1(cwd.encode("utf-8")).hexdigest()[:12]
+    res = await codex_runner.run(
+        prompt,
+        "worker:%s" % key,
+        resume=False,
+        system_prompt=WORKER_CODEX_SYSTEM,
+        cwd=cwd,
+        timeout=timeout,
+        model=model if provider == "codex" else "",
+    )
+    if res.get("is_error"):
+        return {"is_error": True, "text": res.get("text") or "", "error": res.get("error") or "codex error"}
+    return {"is_error": False, "text": res.get("text") or "", "error": ""}
+
+
+async def _run_code_agent(prompt: str, cwd: str, timeout: int = 1080) -> dict:
+    provider, _model = _worker_brain()
+    if provider == "codex":
+        return await _run_codex(prompt, cwd, timeout=timeout)
+    return await _run_claude(prompt, cwd, timeout=timeout)
+
+
 def _field(bug_fields: dict) -> dict:
     """把表格字段映射成 build_fix_prompt 要的 key（容错不同列名）。"""
     f = bug_fields
@@ -476,12 +514,12 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
     try:
         # 领单加锁：先把状态改成"修复中"
         await write_back(base_token, table_id, rid, {STATUS_FIELD: "修复中"})
-        # 下载 BUG 截图（前端/UI BUG 描述常很简，截图才是问题现场）→ 让 claude 先看图再修
+        # 下载 BUG 截图（前端/UI BUG 描述常很简，截图才是问题现场）→ 让代码 agent 先看图再修
         shots = await download_bug_attachments(base_token, table_id, rid)
         if shots:
-            print("[worker] #%s 带 %d 张截图，已下载给 claude 看：%s" % (bug["编号"], len(shots), shots), flush=True)
-        res = await _run_claude(build_fix_prompt(bug, screenshots=shots), cwd=wt)
-        # 超时不白干：把 claude 临死前的分析当线索交给人，转「待人工确认」（沉没成本红线）
+            print("[worker] #%s 带 %d 张截图，已下载给代码 agent 看：%s" % (bug["编号"], len(shots), shots), flush=True)
+        res = await _run_code_agent(build_fix_prompt(bug, screenshots=shots), cwd=wt)
+        # 超时不白干：把代码 agent 最后的分析当线索交给人，转「待人工确认」（沉没成本红线）
         if res.get("error") == "timeout":
             analysis = (res.get("analysis") or "").strip()
             q = ("这条偏复杂、我在限定时间内没改完。我已经查到的线索：%s" % analysis) if analysis \
@@ -551,7 +589,7 @@ async def fix_one_multi(rec: dict, repos: dict, base_token: str, table_id: str) 
         await write_back(base_token, table_id, rid, {STATUS_FIELD: "修复中"})
         shots = await download_bug_attachments(base_token, table_id, rid)
         prompt = build_fix_prompt_multi(bug, [(m, d) for m, d, _t, _u, _w in located], branch, screenshots=shots)
-        res = await _run_claude(prompt, cwd=parent)
+        res = await _run_code_agent(prompt, cwd=parent)
         if res.get("error") == "timeout":
             analysis = (res.get("analysis") or "").strip()
             q = ("这条偏复杂、限定时间没改完。已查到的线索：%s" % analysis) if analysis \
@@ -663,11 +701,13 @@ async def check_ready(chat_id: str) -> None:
     else:
         print("  ✓ 群配置齐全（role/base/%d 个仓库）" % len(repos))
 
+    repo_urls = []
     for name, repo in repos.items():
         loc = repo_locate.locate(repo)
         if not loc:
             print("  ✗ [%s] 不是有效 git 仓库: %s" % (name, repo)); ok = False
             continue
+        repo_urls.append(loc["url"])
         r = subprocess.run(["git", "-C", loc["toplevel"], "rev-parse", "--verify", "dev"],
                            capture_output=True)
         if r.returncode == 0:
@@ -675,22 +715,37 @@ async def check_ready(chat_id: str) -> None:
         else:
             print("  ✗ [%s] 没有 dev 分支（worker 从 dev 切子分支）" % name); ok = False
 
-    if shutil.which("claude"):
-        cp = subprocess.run(["claude", "-p", "ok", "--output-format", "json"],
-                            capture_output=True, text=True)
-        if '"is_error":false' in cp.stdout.replace(" ", ""):
-            print("  ✓ claude 登录可用")
+    provider, model = _worker_brain()
+    print("  • worker brain: %s%s" % (provider, (" (%s)" % model) if model else ""))
+    if provider == "codex":
+        if codex_runner.codex_bin() != "codex" or shutil.which("codex"):
+            ok_codex = await codex_runner.healthcheck()
+            if ok_codex:
+                print("  ✓ codex 可用")
+            else:
+                print("  ✗ codex 不可用（检查 Codex 登录/CLI）"); ok = False
         else:
-            print("  ✗ claude 未登录（claude / claude setup-token）"); ok = False
+            print("  ✗ codex 命令不存在（未找到 Codex CLI）"); ok = False
     else:
-        print("  ✗ claude 命令不存在（worker 当前仍用 Claude Code 改代码）"); ok = False
+        if shutil.which("claude"):
+            cp = subprocess.run(["claude", "-p", "ok", "--output-format", "json"],
+                                capture_output=True, text=True)
+            if '"is_error":false' in cp.stdout.replace(" ", ""):
+                print("  ✓ claude 登录可用")
+            else:
+                print("  ✗ claude 未登录（claude / claude setup-token）"); ok = False
+        else:
+            print("  ✗ claude 命令不存在（worker 当前配置为 Claude Code）"); ok = False
 
-    if shutil.which("gh"):
+    needs_gh = any("github.com" in (u or "") for u in repo_urls)
+    if not needs_gh:
+        print("  ✓ GitLab 仓库不需要 gh（push 后用 GitLab MR 链接）")
+    elif shutil.which("gh"):
         gh = subprocess.run(["gh", "auth", "status"], capture_output=True)
-        print("  ✓ gh 已认证" if gh.returncode == 0 else "  ✗ gh 未认证（gh auth login，提 PR 用）")
+        print("  ✓ gh 已认证" if gh.returncode == 0 else "  ✗ gh 未认证（GitHub 提 PR 用）")
         ok = ok and gh.returncode == 0
     else:
-        print("  ✗ gh 命令不存在（提 PR/MR 用；GitLab 项目也需要对应 CLI 或后续适配）")
+        print("  ✗ gh 命令不存在（GitHub 提 PR 用）")
         ok = False
 
     if not miss:
