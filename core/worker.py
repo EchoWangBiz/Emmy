@@ -2,13 +2,13 @@
 """
 core/worker.py —— 修复 worker（代码侧 agent，独立进程）
 
-主链路：读 BUG 表「待修复」→ 定位本地项目 → 开 git worktree → 让 claude 在 worktree 里改代码
-        → 提 PR（绝不合主干，停在 PR 等人）→ 回写表格状态（待发布 / 待人工确认）。
+主链路：读 BUG 表「待修复」→ 定位本地项目 → 开 git worktree → 让代码 agent 在 worktree 里改代码
+        → 提 MR/PR（绝不合主干，停在 review 等人）→ 回写表格状态（待发布 / 待人工确认）。
 
-【为什么是独立进程】飞书侧 Emmy(run.py) 的 claude 把 Bash(git:*) 挡了、只放 Bash(lark-cli:*)，
+【为什么是独立进程】飞书侧 Emmy(run.py) 的聊天大脑把 Bash(git:*) 挡了、只放 Bash(lark-cli:*)，
   改不了代码。worker 是另一个进程、另一套 allowedTools（放开 git/gh/构建工具，仍挡 rm/sudo）。
 
-【安全红线】① worker 在独立 worktree 改，绝不碰用户工作副本 ② 只提 PR，绝不 merge/push dev|main
+【安全红线】① worker 在独立 worktree 改，绝不碰用户工作副本 ② 只提 MR/PR，绝不 merge/push dev|main
             ③ 拿不准 → 不硬改，回 BLOCKED，状态停"待人工确认"等人答。
 
 跑法（端到端，需 emmy.yaml 配好 fix-bug 群的 base/repo）：python core/worker.py <chat_id>
@@ -28,7 +28,7 @@ from core import brain, claude_runner, codex_runner, config, repo_locate  # noqa
 
 PIPE = asyncio.subprocess.PIPE
 
-# worker 的 claude 权限：放开改代码要用的，仍挡破坏性命令
+# Claude worker 的权限：放开改代码要用的，仍挡破坏性命令
 WORKER_ALLOWED = ("Bash(git:*) Bash(gh:*) Bash(npm:*) Bash(yarn:*) Bash(pnpm:*) Bash(bun:*) "
                   "Bash(python3:*) Bash(node:*) Bash(ls:*) Bash(cat:*) Bash(grep:*) "
                   "Bash(rg:*) Bash(find:*) Bash(tail:*) Bash(head:*) Bash(wc:*) Edit Write Read")
@@ -62,9 +62,9 @@ def branch_slug(num) -> str:
 
 # ---------------- prompt ----------------
 def build_fix_prompt(bug: dict, base_branch: str = "dev", screenshots: list = None) -> str:
-    """给 worker 的 claude 的修复指引（含 git-workflow 约束 + DONE/BLOCKED 输出契约）。
+    """给 worker 代码 agent 的修复指引（含 git-workflow 约束 + DONE/BLOCKED 输出契约）。
     screenshots：BUG 截图的本地路径列表——这类前端/UI BUG 往往描述很简（一句话），截图才是问题现场，
-    所以让 claude 动手前先用 Read 看图、据图定位（实测能把"盲找半天"变成"直奔问题组件"）。"""
+    所以让代码 agent 动手前先用 Read 看图、据图定位（实测能把"盲找半天"变成"直奔问题组件"）。"""
     extra = ("  ⚠️ 这条之前卡在「待人工确认」、提问人已补充：%s —— 按这个补充信息接着修。\n"
              % bug["答复"]) if bug.get("答复") else ""
     shot_block = ""
@@ -119,7 +119,7 @@ def _safe_seg(s) -> str:
 
 def build_fix_prompt_multi(bug: dict, repo_dirs: list, branch: str,
                            base_branch: str = "dev", screenshots: list = None) -> str:
-    """多仓修复指引：把该群【所有仓】各挂一个 worktree 子目录，让 claude 跨仓修。
+    """多仓修复指引：把该群【所有仓】各挂一个 worktree 子目录，让代码 agent 跨仓修。
     repo_dirs: [(模块名, 子目录名)] —— 子目录在 cwd 下，各自已在 bugfix 分支上。"""
     extra = ("  ⚠️ 这条之前卡在「待人工确认」、提问人已补充：%s —— 按这个接着修。\n"
              % bug["答复"]) if bug.get("答复") else ""
@@ -157,7 +157,7 @@ def build_fix_prompt_multi(bug: dict, repo_dirs: list, branch: str,
 
 
 def parse_worker_reply(text: str) -> dict:
-    """从 claude 最终回复里抠出 DONE/BLOCKED。"""
+    """从代码 agent 最终回复里抠出 DONE/BLOCKED。"""
     for line in reversed((text or "").strip().splitlines()):
         s = line.strip()
         if s.startswith("DONE:"):
@@ -319,7 +319,7 @@ async def notify_results(chat_id: str, results: list) -> None:
         await _send_group(chat_id, "以上修好的都在「待发布」啦~ 要发布到 DEV 的话，跟我说一声「发布」就自动合进 DEV、构建、通知验收 🚀")
 
 
-# ---------------- worker claude 调用 ----------------
+# ---------------- worker 代码 agent 调用 ----------------
 def _session_dir_for(cwd: str) -> str:
     """claude 把 cwd 转义成 ~/.claude/projects/<munged> 存 session（/ . _ 都换成 -）。"""
     munged = re.sub(r"[/._]", "-", cwd)
@@ -396,12 +396,19 @@ async def _run_codex(prompt: str, cwd: str, timeout: int = 1080) -> dict:
         resume=False,
         system_prompt=WORKER_CODEX_SYSTEM,
         cwd=cwd,
+        env={**os.environ, "EMMY_CODEX_SKIP_GIT_REPO_CHECK": "1"},
         timeout=timeout,
         model=model if provider == "codex" else "",
     )
     if res.get("is_error"):
-        return {"is_error": True, "text": res.get("text") or "", "error": res.get("error") or "codex error"}
-    return {"is_error": False, "text": res.get("text") or "", "error": ""}
+        return {"is_error": True, "text": res.get("text") or "", "error": res.get("error") or "codex error",
+                "raw_stdout_tail": res.get("raw_stdout_tail") or "", "raw_stderr_tail": res.get("raw_stderr_tail") or ""}
+    text = res.get("text") or ""
+    if not text.strip():
+        return {"is_error": True, "text": "", "error": "codex empty response",
+                "raw_stdout_tail": res.get("raw_stdout_tail") or "", "raw_stderr_tail": res.get("raw_stderr_tail") or ""}
+    return {"is_error": False, "text": text, "error": "",
+            "raw_stdout_tail": res.get("raw_stdout_tail") or "", "raw_stderr_tail": res.get("raw_stderr_tail") or ""}
 
 
 async def _run_code_agent(prompt: str, cwd: str, timeout: int = 1080) -> dict:
@@ -409,6 +416,29 @@ async def _run_code_agent(prompt: str, cwd: str, timeout: int = 1080) -> dict:
     if provider == "codex":
         return await _run_codex(prompt, cwd, timeout=timeout)
     return await _run_claude(prompt, cwd, timeout=timeout)
+
+
+def _agent_diag(res: dict, max_chars: int = 300) -> str:
+    """Turn agent failure output into a short table-safe diagnostic."""
+    parts = []
+    err = (res or {}).get("error")
+    if err:
+        parts.append(str(err))
+    stderr = ((res or {}).get("raw_stderr_tail") or (res or {}).get("raw_stderr") or "").strip()
+    if stderr:
+        parts.append(stderr.splitlines()[-1])
+    stdout = ((res or {}).get("raw_stdout_tail") or "").strip()
+    if stdout and "codex empty response" in str(err):
+        parts.append(stdout.splitlines()[-1])
+    text = "；".join(p for p in parts if p).strip()
+    return (text or "代码 agent 未返回 DONE/BLOCKED")[:max_chars]
+
+
+async def _write_agent_error(base_token: str, table_id: str, rid: str, res: dict) -> dict:
+    note = "代码 agent 失败：%s" % _agent_diag(res, 260)
+    await write_back(base_token, table_id, rid,
+                     {STATUS_FIELD: "待人工确认", "AI备注": note[:300]})
+    return {"result": "unknown", "reason": note[:120]}
 
 
 def _field(bug_fields: dict) -> dict:
@@ -441,7 +471,7 @@ def _pick_repo(repos: dict, module: str):
 
 # ---------------- MR/PR 链接（框架确定性构造，不靠 claude 编）----------------
 def _mr_url(repo_url: str, branch: str, base: str = "dev") -> str:
-    """构造 MR/PR 创建链接。claude 从 push 输出抠链接不可靠（分支已存在时抠不到会瞎编成
+    """构造 MR/PR 创建链接。代码 agent 从 push 输出抠链接不可靠（分支已存在时抠不到会瞎编成
     登录页之类），所以由 worker 用 repo URL + 分支名确定性拼。repo_url 是规范化 https://host/group/proj。"""
     from urllib.parse import quote
     b, t = quote(branch, safe=""), quote(base, safe="")
@@ -457,7 +487,7 @@ _ATTACH_BASE = os.path.expanduser("~/.emmy/bug-attachments")
 
 
 async def download_bug_attachments(base_token: str, table_id: str, record_id: str) -> list:
-    """下载这条 BUG 记录的截图附件，返回本地图片【绝对路径】列表（喂给 claude 先看图再修）。
+    """下载这条 BUG 记录的截图附件，返回本地图片【绝对路径】列表（喂给代码 agent 先看图再修）。
     lark-cli `+record-download-attachment` 的 --output 要求是 cwd 内相对路径（安全限制），
     所以把子进程 cwd 设到目标目录、用 ./。没附件/下载失败都不致命（返回空列表，照常按文字修）。"""
     out_dir = os.path.join(_ATTACH_BASE, record_id)
@@ -528,16 +558,19 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
                              {STATUS_FIELD: "待人工确认", "待确认问题": q[:500],
                               "AI备注": "worker 超时未完成（已尽量留下排查线索）"})
             return {"id": bug["编号"], "result": "blocked", "q": q}
+        if res.get("is_error"):
+            r = await _write_agent_error(base_token, table_id, rid, res)
+            return {"id": bug["编号"], **r}
         reply = parse_worker_reply(res.get("text", ""))
         if reply["outcome"] == "done":
-            # 先确认分支真推上去了（claude 可能嘴上说 done 但没 push）
+            # 先确认分支真推上去了（代码 agent 可能嘴上说 done 但没 push）
             if not repo_locate.branch_on_remote(top, branch):
                 await write_back(base_token, table_id, rid,
                                  {STATUS_FIELD: "待人工确认",
                                   "AI备注": ("说改完了但分支没推上去，需人工核实。" + reply.get("note", ""))[:200]})
                 return {"id": bug["编号"], "result": "unknown",
                         "reason": "代码改了但分支没推上去，我再看看 / 麻烦人工核实下"}
-            pr_url = _mr_url(loc["url"], branch)   # 框架确定性构造，不用 claude 给的
+            pr_url = _mr_url(loc["url"], branch)   # 框架确定性构造，不用代码 agent 给的
             wrote = await write_back(base_token, table_id, rid,
                                      {STATUS_FIELD: "待发布", "修复分支/PR": pr_url,
                                       "AI备注": reply.get("note", "")})
@@ -547,16 +580,17 @@ async def fix_one(rec: dict, repo_path: str, base_token: str, table_id: str) -> 
                              {STATUS_FIELD: "待人工确认", "待确认问题": reply.get("question", "")})
             return {"id": bug["编号"], "result": "blocked", "q": reply.get("question")}
         else:
+            note = reply.get("note") or _agent_diag(res)
             await write_back(base_token, table_id, rid,
-                             {STATUS_FIELD: "待人工确认", "AI备注": "worker 未明确完成：" + reply.get("note", "")[:200]})
+                             {STATUS_FIELD: "待人工确认", "AI备注": ("worker 未明确完成：" + note)[:300]})
             return {"id": bug["编号"], "result": "unknown",
-                    "reason": "我处理了一下但没完全搞定，麻烦人工看一眼"}
+                    "reason": ("代码 agent 没有给出可落地结果：%s" % note)[:120]}
     finally:
         repo_locate.remove_worktree(top, wt)  # 清 worktree，保留分支(供 PR)
 
 
 async def fix_one_multi(rec: dict, repos: dict, base_token: str, table_id: str) -> dict:
-    """多仓修复：给该群【所有仓】各开一个 worktree（挂同一父目录的子目录），跑一次 claude 跨仓修，
+    """多仓修复：给该群【所有仓】各开一个 worktree（挂同一父目录的子目录），跑一次代码 agent 跨仓修，
     跑完逐仓检测哪个分支推上去了 → 各自出 PR、回写（修复分支/PR 可能多条）。不靠「所属模块」路由。"""
     bug = _field(rec.get("fields") or {})
     rid = rec["record_id"]
@@ -597,6 +631,9 @@ async def fix_one_multi(rec: dict, repos: dict, base_token: str, table_id: str) 
             await write_back(base_token, table_id, rid,
                              {STATUS_FIELD: "待人工确认", "待确认问题": q[:500], "AI备注": "worker 超时未完成"})
             return {"id": bug["编号"], "result": "blocked", "q": q}
+        if res.get("is_error"):
+            r = await _write_agent_error(base_token, table_id, rid, res)
+            return {"id": bug["编号"], **r}
         reply = parse_worker_reply(res.get("text", ""))
         # 逐仓检测哪个分支真推上去了（= 实际改动的仓）
         fixed = [(m, u) for m, _d, top, u, _w in located if repo_locate.branch_on_remote(top, branch)]
@@ -611,11 +648,12 @@ async def fix_one_multi(rec: dict, repos: dict, base_token: str, table_id: str) 
             await write_back(base_token, table_id, rid,
                              {STATUS_FIELD: "待人工确认", "待确认问题": reply.get("question", "")})
             return {"id": bug["编号"], "result": "blocked", "q": reply.get("question")}
+        note = reply.get("note") or _agent_diag(res)
         await write_back(base_token, table_id, rid,
                          {STATUS_FIELD: "待人工确认",
-                          "AI备注": ("worker 未推任何分支（说：%s）" % reply.get("note", ""))[:200]})
+                          "AI备注": ("worker 未推任何分支（说：%s）" % note)[:300]})
         return {"id": bug["编号"], "result": "unknown",
-                "reason": "我处理了一下但没改出能提交的东西，麻烦人工看一眼"}
+                "reason": ("代码 agent 没推分支：%s" % note)[:120]}
     finally:
         for _m, _d, top, _u, wt in located:
             repo_locate.remove_worktree(top, wt)
@@ -809,6 +847,13 @@ def _selftest() -> None:
     assert parse_worker_reply("一堆分析\nBLOCKED: 两种改法不确定选哪个")["outcome"] == "blocked"
     assert parse_worker_reply("没头没尾")["outcome"] == "unknown"
     print("✓ parse_worker_reply 解析 DONE/BLOCKED/unknown")
+
+    diag = _agent_diag({"error": "codex empty response",
+                        "raw_stdout_tail": '{"type":"turn.completed"}\n',
+                        "raw_stderr_tail": "WARN noisy\nlast useful line\n"})
+    assert "codex empty response" in diag and "last useful line" in diag, diag
+    assert _agent_diag({}) == "代码 agent 未返回 DONE/BLOCKED"
+    print("✓ _agent_diag：代码 agent 失败/空输出时保留可诊断原因")
 
     # 3) lark-cli 命令构造（正确 flag：--base-token / --json record_id_list+patch）
     lc = build_list_cmd("bascn_x", "tbl_x")
