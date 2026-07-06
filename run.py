@@ -23,6 +23,7 @@ import random
 import re
 import sys
 import time
+from urllib.parse import parse_qs, urlparse
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -109,6 +110,73 @@ def _with_chat_context(chat_id: str, content: str, sender_id: str = "") -> str:
 _CONFIG_RE = re.compile(r"<EMMY_CONFIG>\s*(\{.*?\})\s*</EMMY_CONFIG>", re.S)
 _ALLOWED_KEYS = ("name", "role", "base_app_token", "base_table_id", "repo", "repos",
                  "jenkins_jobs", "initialized")
+_URL_RE = re.compile(r"https?://[^\s<>'\"`]+")
+
+
+def _base_binding_from_url(url: str) -> Optional[dict]:
+    """从普通 Base URL 里直接解析 app_token/table_id；Wiki URL 交给 async resolver。"""
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return None
+    parts = [p for p in u.path.split("/") if p]
+    qs = parse_qs(u.query)
+    table_id = (qs.get("table") or [""])[0]
+    if len(parts) >= 2 and parts[0] == "base" and table_id:
+        return {"base_app_token": parts[1], "base_table_id": table_id,
+                "source": "base-url"}
+    return None
+
+
+async def _resolve_wiki_base_url(url: str) -> Optional[dict]:
+    """用户给 Wiki 里的 Base 链接时，解析真实 bitable obj_token + table query。只读，不改飞书。"""
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return None
+    parts = [p for p in u.path.split("/") if p]
+    table_id = (parse_qs(u.query).get("table") or [""])[0]
+    if not (len(parts) >= 2 and parts[0] == "wiki" and table_id):
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        "lark-cli", "wiki", "+node-get", "--node-token", url, "--format", "json",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        print("[run] wiki base 链接解析失败: %s" % err.decode("utf-8", "replace")[:200], flush=True)
+        return None
+    try:
+        d = json.loads(out.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return None
+    data = (d or {}).get("data") or {}
+    if data.get("obj_type") != "bitable" or not data.get("obj_token"):
+        return None
+    return {"base_app_token": data["obj_token"], "base_table_id": table_id,
+            "source": "wiki-url", "wiki_node_token": data.get("node_token", "")}
+
+
+async def _annotate_base_links(content: str) -> str:
+    """把消息里可识别的 Base/Wiki-Base 链接解析结果作为框架可信上下文注入给大脑。"""
+    if not content:
+        return content
+    found = []
+    for url in _URL_RE.findall(content):
+        direct = _base_binding_from_url(url)
+        if direct:
+            found.append(direct)
+            continue
+        via_wiki = await _resolve_wiki_base_url(url)
+        if via_wiki:
+            found.append(via_wiki)
+    if not found:
+        return content
+    lines = ["【框架已解析到 BUG 多维表格链接，直接使用这些值，不要再说链接格式不对】"]
+    for item in found:
+        lines.append("- base_app_token=%s, base_table_id=%s（来源: %s%s）" % (
+            item["base_app_token"], item["base_table_id"], item["source"],
+            ", wiki_node_token=%s" % item["wiki_node_token"] if item.get("wiki_node_token") else ""))
+    return content + "\n\n" + "\n".join(lines)
 
 
 def _is_initialized(cc: dict) -> bool:
@@ -125,9 +193,9 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
 1) 先确认意图：这个群想让我干啥？目前我会【修 BUG】(role=fix-bug)。不是的话就先问清楚。
 
 2) 是修 BUG 的话，要这几样：
-   - BUG 多维表格：**有现成的**就给【分享链接】（我从 `.../base/<app_token>?table=<table_id>` 取 token）；**没有就我自己建**、不用你动手（见第 3 步）
+   - BUG 多维表格：**有现成的**就给【分享链接】。普通 `.../base/<app_token>?table=<table_id>` 可直接取 token；如果是 `.../wiki/<wiki_node_token>?table=<table_id>`，先用 `emmy-lark wiki +node-get --node-token "<完整链接>"`，返回里 `data.obj_type=bitable` 时 `data.obj_token` 就是 `base_app_token`，URL 里的 `table` 就是 `base_table_id`。框架若已在消息末尾注入「已解析到 BUG 多维表格链接」，直接用那两个值，别再说格式不对。**没有表就我自己建**、不用你动手（见第 3 步）
    - 代码项目的本地【绝对路径】——可能不止一个仓（前端 / 后端），按【模块→路径】分别问清（如 前端=/Users/xxx/llm-platform-web、后端=/Users/xxx/llm-platform）；只有一个仓也行
-   - 【自动发布到 DEV 用】每个项目的 Jenkins job 名（按【模块→job 名】问，如 前端=llmmarket-platform-web-dev）。这步**可选**——不配就只到「待发布」、发布得人工，配了我才能在你说「发布」时自动合 DEV + 构建。
+   - 发布配置：**不要问 Jenkins job 名**。现在发布 job 由各项目自己的 publish skill 管，默认就是项目自己的 dev 发布流程；你只需要提醒群主：要自动发布，项目仓里放好 `.claude/skills/publish/SKILL.md` 或 `.agents/skills/publish/SKILL.md`，并在这台机器上装好/登录好 `jkit`。如果群主说 job 名固定是「项目名_dev」，也不用写进 emmy.yaml。
 
 3) 准备好 BUG 表（用 emmy-lark；已有表用链接里解析的 token，没有就先自建）：
    - **没有现成表 → 我自己建一张**（你确认过要我自建，别再让群主手动建）：
@@ -146,11 +214,11 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
    发 → `emmy-lark im +messages-send --as bot --chat-id __CID__ --msg-type text --content '{"text":"📊 BUG 表在这儿：<表链接>"}'`（记下返回的 message_id）
    pin → `emmy-lark im pins create --chat-id __CID__ --message-id <上一步的 message_id>`
 
-4.5) 自动发布(可选)：发布到 DEV 走 Jenkins，用 `jkit` 工具。**我自己跑不了 jkit**（权限只在 emmy-lark），所以这步靠群主：请在【跑我的这台机器】上装好 jkit 并登录一次——`jkit auth login --host <jenkins地址> --user <用户> --token <令牌>`（host/token 群主自己填，我不经手）。装好后把【每个项目的 job 名】告诉我（见第 2 步），我写进配置；以后你说「发布」我就能自动合 DEV + 构建。没装/没配也行，那就只到「待发布」、发布人工来。
+4.5) 自动发布(可选)：发布到 DEV 由【项目自己的 publish skill】负责，Emmy 不收集 Jenkins job 名、不把 job 名写进配置。请群主确认两件事即可：这台机器装好并登录 `jkit`；每个项目仓里有 `.claude/skills/publish/SKILL.md`（或 `.agents/skills/publish/SKILL.md`），里面写清本项目 dev 发布流程（比如 job 固定为「项目名_dev」）。没配也行——那就只到「待发布」、发布人工来。
 
 5) 全部 OK 后（意图确认 + 表字段/选项齐 + 群里能找到表入口[已置顶或已有文档标签页即可，没有也不强求] + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
-<EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"jenkins_jobs":{"前端":"web-dev-job名","后端":"srv-dev-job名"},"initialized":true}</EMMY_CONFIG>
-（只有一个仓就 repos 里写一个；模块名尽量用表里「所属模块」会出现的值，worker 据此按模块路由；jenkins_jobs 可选、没配自动发布就省略它，模块名要和 repos 对应）
+<EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"initialized":true}</EMMY_CONFIG>
+（只有一个仓就 repos 里写一个；不要写 jenkins_jobs，发布流程不再靠 emmy.yaml 存 job 名）
 **还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
 
 对方刚说：__CONTENT__"""
@@ -319,6 +387,8 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
 
     # 群聊：入群初始化闸（没初始化过 → onboarding 自检引导；初始化完成 → 注入群上下文正常干活）
     inited = _is_initialized(cc)
+    if not inited:
+        content = await _annotate_base_links(content)
     prompt = _with_chat_context(chat_id, content, sender_id) if inited else _onboard_prompt(chat_id, content)
     res = await brain.run(
         prompt, chat_id, resume=resume, system_prompt=system_prompt, cwd=PROJECT_DIR, sender_id=sender_id)

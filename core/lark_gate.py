@@ -48,6 +48,8 @@ _ALLOWED_PREFIXES = (
     "im +messages-send", "im +messages-reply",
     # —— im 置顶：onboarding 时把 BUG 表入口 pin 到群里 ——
     "im pins list", "im pins create",
+    # —— wiki 只读：用户给 Wiki 里的 Base 链接时，用 node-get 解析出真实 bitable obj_token ——
+    "wiki +node-get",
     # —— 联系人：搜人（@ 提问人要用）——
     "contact +search-user",
 )
@@ -146,6 +148,7 @@ def _selftest() -> None:
     assert not blocked(["im", "--help"])
     assert not blocked(["im", "pins", "list", "--chat-id", "oc_x"])
     assert not blocked(["im", "pins", "create", "--chat-id", "oc_x", "--message-id", "om_x"])
+    assert not blocked(["wiki", "+node-get", "--node-token", "https://example.feishu.cn/wiki/wikcn_x?table=tbl_x"])
     assert not blocked(["base", "+record-batch-update", "--base-token", "t", "--table-id", "tb",
                         "--json", '{"record_id_list":["rec1"],"patch":{"状态":"待修复"}}'])
     # 登记新 BUG：小批量建记录放行（rows ≤ 阈值）
@@ -181,6 +184,7 @@ def _selftest() -> None:
     assert blocked(["base", "+field-update", "--base-token", "t", "--field-id", "f"])  # 改字段类型 high-risk
     assert blocked(["base", "+table-delete", "--base-token", "t"])
     assert blocked(["wiki", "+move", "--node-token", "n"])
+    assert blocked(["wiki", "+node-delete", "--node-token", "n"])
     assert blocked(["approval", "instances", "cancel", "--instance-id", "i"])
     assert blocked(["drive", "+version-revert", "--file-token", "f"])
     assert blocked(["api", "POST", "/open-apis/bitable/v1/.../batch_update"])          # api 写
