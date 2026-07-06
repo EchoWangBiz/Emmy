@@ -2,12 +2,14 @@
 #
 # Emmy start.sh —— launchd 后台守护管理
 #
-#   ./start.sh [start]      安装 LaunchAgent 并启动（登录即自动运行、崩溃自愈）
+#   ./start.sh [start] [--brain claude|codex] [--model MODEL]
+#                           安装 LaunchAgent 并启动（登录即自动运行、崩溃自愈）
 #   ./start.sh stop         停止并卸载
 #   ./start.sh restart      重启
 #   ./start.sh status       看运行状态
 #   ./start.sh logs         跟踪日志（tail -f）
-#   ./start.sh fg           前台运行（调试，不走 launchd）
+#   ./start.sh fg [--brain claude|codex] [--model MODEL]
+#                           前台运行（调试，不走 launchd）
 #   ./start.sh print-plist  打印将生成的 plist（不安装，便于检查）
 #
 # launchd 关键点（踩过的坑都写死在 plist 里）：
@@ -23,6 +25,12 @@ BOLD=$'\033[1m'; GREEN=$'\033[32m'; RED=$'\033[31m'; DIM=$'\033[2m'; RESET=$'\03
 ok()   { printf "  ${GREEN}✓${RESET} %s\n" "$1"; }
 err()  { printf "  ${RED}✗${RESET} %s\n" "$1"; }
 info() { printf "    ${DIM}↳ %s${RESET}\n" "$1"; }
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"
+  s="${s//\"/&quot;}"; s="${s//\'/&apos;}"
+  printf '%s' "$s"
+}
 
 # ---------- 路径与常量 ----------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +52,12 @@ fi
 
 # ---------- 生成 plist 文本 ----------
 emit_plist() {
+  local extra=""
+  local arg
+  for arg in "$@"; do
+    extra="$extra
+        <string>$(xml_escape "$arg")</string>"
+  done
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -55,6 +69,7 @@ emit_plist() {
     <array>
         <string>$PYTHON</string>
         <string>$SCRIPT_DIR/run.py</string>
+        $extra
     </array>
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
@@ -87,14 +102,14 @@ EOF
 
 install_plist() {
   mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
-  emit_plist > "$PLIST"
+  emit_plist "$@" > "$PLIST"
 }
 
 # ---------- 命令 ----------
 cmd_start() {
   [ -n "$PYTHON" ] || { err "找不到 python3，请先 ./init.sh"; exit 1; }
   [ -f "$SCRIPT_DIR/run.py" ] || { err "找不到 $SCRIPT_DIR/run.py"; exit 1; }
-  install_plist
+  install_plist "$@"
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true   # 幂等：先卸旧再装
   if launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then
     ok "Emmy 已安装并启动（登录即自动运行、崩溃自愈）"
@@ -103,6 +118,7 @@ cmd_start() {
     ok "Emmy 已（重新）启动"
   fi
   info "状态：./start.sh status    日志：./start.sh logs    停止：./start.sh stop"
+  [ "$#" -gt 0 ] && info "启动参数：$*"
 }
 
 cmd_stop() {
@@ -129,21 +145,23 @@ cmd_logs() {
 
 cmd_fg() {
   [ -n "$PYTHON" ] || { err "找不到 python3，请先 ./init.sh"; exit 1; }
-  exec "$PYTHON" "$SCRIPT_DIR/run.py"
+  exec "$PYTHON" "$SCRIPT_DIR/run.py" "$@"
 }
 
 usage() {
-  printf "用法: %s [start|stop|restart|status|logs|fg|print-plist]\n" "$(basename "$0")"
+  printf "用法: %s [start|stop|restart|status|logs|fg|print-plist] [--brain claude|codex] [--model MODEL]\n" "$(basename "$0")"
 }
 
-case "${1:-start}" in
-  start | "")    cmd_start ;;
+cmd="${1:-start}"
+case "$cmd" in
+  start | "")    [ "$#" -gt 0 ] && shift; cmd_start "$@" ;;
   stop)          cmd_stop ;;
-  restart)       cmd_stop; sleep 1; cmd_start ;;
+  restart)       shift; cmd_stop; sleep 1; cmd_start "$@" ;;
   status)        cmd_status ;;
   logs)          cmd_logs ;;
-  fg | --foreground) cmd_fg ;;
-  print-plist)   emit_plist ;;
+  fg | --foreground) shift; cmd_fg "$@" ;;
+  print-plist)   shift; emit_plist "$@" ;;
   -h | --help | help) usage ;;
+  --brain | --model) cmd_start "$@" ;;
   *)             usage; exit 1 ;;
 esac

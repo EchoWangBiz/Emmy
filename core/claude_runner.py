@@ -88,10 +88,11 @@ def parse_result(stdout: str) -> dict:
 
 async def _invoke(
     prompt: str, sid: str, *, resume: bool,
-    system_prompt: str, cwd: Optional[str], env: Optional[dict], timeout: int,
+    system_prompt: str, cwd: Optional[str], env: Optional[dict], timeout: int, model: str,
 ) -> dict:
     """实际跑一次 claude；总是带回 raw_stderr（自愈判断 + 诊断都要用）。"""
-    cmd = build_cmd(prompt, sid, resume=resume, system_prompt=system_prompt)
+    cmd = build_cmd(prompt, sid, resume=resume, system_prompt=system_prompt,
+                    model=model or "claude-sonnet-5")
     # 把项目 bin/ 注入 PATH，让 claude 的 Bash 能找到包装命令 emmy-lark（原 PATH 保留，claude/lark-cli 仍可寻）
     proc_env = dict(env or os.environ)
     if cwd:
@@ -121,6 +122,7 @@ async def run(
     env: Optional[dict] = None,
     timeout: int = 180,
     sender_id: str = "",
+    model: str = "",
 ) -> dict:
     """调 claude（带 session 自愈）。
 
@@ -130,16 +132,19 @@ async def run(
     """
     sid = session_id_for(chat_id, system_prompt, sender_id)
     res = await _invoke(prompt, sid, resume=resume,
-                        system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout)
+                        system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout,
+                        model=model)
     stderr = res.get("raw_stderr") or ""
     if res["is_error"] and "already in use" in stderr and not resume:
         # 想新建但 session 已存在 → 改 --resume 续接
         res = await _invoke(prompt, sid, resume=True,
-                            system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout)
+                            system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout,
+                            model=model)
     elif res["is_error"] and "No conversation found" in stderr and resume:
         # 想续接但 session 不存在 → 改 --session-id 新建
         res = await _invoke(prompt, sid, resume=False,
-                            system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout)
+                            system_prompt=system_prompt, cwd=cwd, env=env, timeout=timeout,
+                            model=model)
     return res
 
 

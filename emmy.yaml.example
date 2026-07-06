@@ -22,4 +22,8 @@ chats:
 
 # 全局默认（可选）
 defaults:
-  model: claude-sonnet-4-6
+  # 大脑适配器：claude（默认，Claude Code）或 codex（Codex CLI，实验性）
+  brain: claude
+  # 可选：分别给不同适配器设默认模型；启动参数 --model 会临时覆盖
+  claude_model: claude-sonnet-5
+  codex_model: gpt-5.4
