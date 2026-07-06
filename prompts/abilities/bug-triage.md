@@ -153,6 +153,7 @@ worker 提的 PR 被 review 打回、要按意见再改一版时：
    ```
    emmy-lark base +field-list --base-token <t> --table-id <tbl> --format json
    ```
+   已经拿到 `table_id` 时，初始化不要再跑 `base +table-list`；`table-list` 需要额外 `base:table:read`，缺它不影响已知表的字段自检，也不要把它说成“BUG 表结构读不了”。
 2. **和上面模板逐字段比对**（先查存在再决定，**别重复建**——保证多次进群幂等）。
 3. **缺的业务字段自动补**（纯新增、低危）：
    ```
@@ -189,14 +190,14 @@ emmy-lark base +record-upload-attachment --base-token <t> --table-id <tbl> \
 emmy-lark base +record-batch-update --base-token <t> --table-id <tbl> \
   --json '{"record_id_list":["rec_xxx"],"patch":{"状态":"待修复"}}'
 
-# 拿群成员（@ 用）
+# 拿群成员（只为 @ 用；失败就纯文本写名字，不阻塞登记/初始化）
 emmy-lark im chat.members get --chat-id <群id>
 
 # @ 提问人通知
 emmy-lark im +messages-send --as bot --chat-id <群id> --msg-type text \
   --content '{"text":"<at user_id=\"ou_xxx\"></at> 你提的 #0009 修好了，PR: <链接>，麻烦验收~"}'
 ```
-> @人：先 `chat.members get` 拿 open_id，把提问人名字对上群成员；**对不上 / 重名 → 纯文本写名字，绝不 @ 错人**。
+> @人：先 `chat.members get` 拿 open_id，把提问人名字对上群成员；**权限不足 / 对不上 / 重名 → 纯文本写名字，绝不 @ 错人，也不要因此阻塞登记、初始化或修复流程**。
 
 ---
 

@@ -209,14 +209,16 @@ def _onboard_prompt(chat_id: str, content: str) -> str:
      - 所属模块（可选）：多仓群想给 BUG 标个分类可建 `select`；**但不是必须**——worker 现在多仓会【挂全部仓跨仓修】、不靠它路由，不建也不会卡。
    - ⚠️ 若【状态】已存在但选项不全，我改不了已有字段选项 → 请群主去补成那 8 个
    - 必须齐：状态(8 选项)、提问人、附件/截图、修复分支/PR、AI备注、待确认问题
+   - ⚠️ 初始化验收只以 `base +field-list` 为准：已经有 `base_app_token/table_id` 时不要再跑 `base +table-list`。`table-list` 需要额外 `base:table:read`，缺它不代表这张 BUG 表不能用，也绝对不要因此说“表结构读不了”。
 
 4) 表入口检查（非必须、可跳过）：先看群顶部是不是已经能找到这张 BUG 表的入口——不管是【消息 Pin】(`emmy-lark im pins list --chat-id __CID__`)、还是群顶部那排【文档标签页 / 云文档置顶】。只要已经有任一种入口能点开这张表，就别再重复发 / pin，跳过这步即可；确实一个入口都没有时，再发一条表入口消息并 pin 上：
    发 → `emmy-lark im +messages-send --as bot --chat-id __CID__ --msg-type text --content '{"text":"📊 BUG 表在这儿：<表链接>"}'`（记下返回的 message_id）
    pin → `emmy-lark im pins create --chat-id __CID__ --message-id <上一步的 message_id>`
+   - 不要为了初始化去跑 `im chat.members get`。群成员读取只用于后续 @ 提问人；读不到就纯文本写名字，不卡初始化。
 
 4.5) 自动发布(可选)：发布到 DEV 由【项目自己的 publish skill】负责，Emmy 不收集 Jenkins job 名、不把 job 名写进配置。请群主确认两件事即可：这台机器装好并登录 `jkit`；每个项目仓里有 `.claude/skills/publish/SKILL.md`（或 `.agents/skills/publish/SKILL.md`），里面写清本项目 dev 发布流程（比如 job 固定为「项目名_dev」）。没配也行——那就只到「待发布」、发布人工来。
 
-5) 全部 OK 后（意图确认 + 表字段/选项齐 + 群里能找到表入口[已置顶或已有文档标签页即可，没有也不强求] + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
+5) 全部 OK 后（意图确认 + `field-list` 证明表字段/选项齐 + 群里能找到表入口[已置顶或已有文档标签页即可，没有也不强求] + 仓库路径拿到），在你【那条回复的最末尾】附上这个块（对方看不到，框架会接住写进配置、并标记本群已初始化、以后不再问）：
 <EMMY_CONFIG>{"name":"群备注","role":"fix-bug","base_app_token":"...","base_table_id":"...","repos":{"前端":"/绝对/路径","后端":"/绝对/路径"},"initialized":true}</EMMY_CONFIG>
 （只有一个仓就 repos 里写一个；不要写 jenkins_jobs，发布流程不再靠 emmy.yaml 存 job 名）
 **还没全部搞定就绝对不要吐这个块**（尤其状态选项没补全、repo 没拿到时）。中间每一步都照常用人话跟大家说进展。
