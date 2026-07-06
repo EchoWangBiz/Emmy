@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import uuid
 from typing import List, Optional
 
@@ -23,6 +24,7 @@ PIPE = asyncio.subprocess.PIPE
 
 _NS = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
 _SESSION_FILE = os.path.expanduser("~/.emmy/codex_sessions.json")
+_CODEX_APP_BIN = "/Applications/Codex.app/Contents/Resources/codex"
 
 CODEX_SYSTEM_PREFIX = (
     "你是 Emmy 的大脑。你收到的最终回复会被框架自动发回当前飞书聊天。\n"
@@ -62,6 +64,17 @@ def _compose_prompt(prompt: str, system_prompt: str = "") -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def codex_bin(env: Optional[dict] = None) -> str:
+    """定位 Codex CLI。优先 PATH，macOS 上 fallback 到 Codex.app 内置二进制。"""
+    path = (env or os.environ).get("PATH")
+    found = shutil.which("codex", path=path)
+    if found:
+        return found
+    if os.path.exists(_CODEX_APP_BIN):
+        return _CODEX_APP_BIN
+    return "codex"
+
+
 def build_cmd(
     prompt: str,
     *,
@@ -69,9 +82,10 @@ def build_cmd(
     cwd: Optional[str] = None,
     model: str = "",
     sandbox: str = "read-only",
+    codex_path: str = "codex",
 ) -> List[str]:
     """构造 codex exec 命令（纯函数，便于单测）。"""
-    cmd = ["codex", "exec", "--sandbox", sandbox]
+    cmd = [codex_path, "exec", "--sandbox", sandbox]
     if cwd:
         cmd += ["--cd", cwd]
     if model and not thread_id:
@@ -127,10 +141,11 @@ async def _invoke(
     timeout: int,
     model: str,
 ) -> dict:
-    cmd = build_cmd(prompt, thread_id=thread_id, cwd=cwd, model=model)
     proc_env = dict(env or os.environ)
     if cwd:
         proc_env["PATH"] = os.path.join(cwd, "bin") + os.pathsep + proc_env.get("PATH", "")
+    cmd = build_cmd(prompt, thread_id=thread_id, cwd=cwd, model=model,
+                    codex_path=codex_bin(proc_env))
     proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=proc_env, stdout=PIPE, stderr=PIPE)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -184,8 +199,9 @@ async def run(
 
 
 async def healthcheck() -> bool:
+    path = codex_bin()
     proc = await asyncio.create_subprocess_exec(
-        "codex", "exec", "--json", "--sandbox", "read-only", "--skip-git-repo-check",
+        path, "exec", "--json", "--sandbox", "read-only", "--skip-git-repo-check",
         "Return exactly ok.", stdout=PIPE, stderr=PIPE)
     out, _ = await proc.communicate()
     return proc.returncode == 0 and not parse_jsonl(out.decode("utf-8", "replace"))["is_error"]
@@ -204,6 +220,9 @@ def _selftest() -> None:
     assert "resume" not in cmd
     cmd2 = build_cmd("again", thread_id="tid", cwd="/tmp/repo")
     assert "resume" in cmd2 and "tid" in cmd2 and "again" in cmd2
+    cmd3 = build_cmd("hi", codex_path="/x/codex")
+    assert cmd3[0] == "/x/codex"
+    assert codex_bin({"PATH": "/no/such/path"}) in ("codex", _CODEX_APP_BIN)
     print("✓ codex build_cmd 新建/续聊")
 
     out = "\n".join([
