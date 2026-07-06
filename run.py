@@ -327,11 +327,12 @@ async def _dispatch_publish(chat_id: str, scope: str = "") -> bool:
 
 
 def _diagnose(res: dict) -> str:
-    """claude 出错时在终端打印详细诊断（含原始输出，方便排查），返回给用户的简短文案。"""
-    print(f"[run] ⚠️ claude 出错: {res.get('error')} (returncode={res.get('returncode')})", flush=True)
+    """大脑出错时在终端打印详细诊断（含原始输出，方便排查），返回给用户的简短文案。"""
+    provider, _model = brain.current()
+    print(f"[run] ⚠️ {provider} 出错: {res.get('error')} (returncode={res.get('returncode')})", flush=True)
     if res.get("raw_stdout") is not None:
-        print("[run] ---- claude raw stdout ----\n" + (res.get("raw_stdout") or "(空)"), flush=True)
-        print("[run] ---- claude stderr ----\n" + (res.get("raw_stderr") or "(空)"), flush=True)
+        print(f"[run] ---- {provider} raw stdout ----\n" + (res.get("raw_stdout") or "(空)"), flush=True)
+        print(f"[run] ---- {provider} stderr ----\n" + (res.get("raw_stderr") or "(空)"), flush=True)
     return "（出错了：%s）" % (res.get("error") or res.get("text") or "未知")
 
 

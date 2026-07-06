@@ -52,6 +52,24 @@ def resolve_model(provider: str, cli_value: Optional[str] = None) -> str:
     return ""
 
 
+def resolve_timeout(provider: str) -> int:
+    """Brain subprocess timeout in seconds. Codex first turns are often slower than Claude."""
+    d = defaults()
+    raw = (
+        os.environ.get("EMMY_BRAIN_TIMEOUT")
+        or d.get("%s_timeout" % provider)
+        or d.get("brain_timeout")
+    )
+    if raw:
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    return 600 if provider == "codex" else 180
+
+
 def configure(provider: Optional[str] = None, model: Optional[str] = None) -> tuple:
     global _provider, _model
     _provider = resolve_provider(provider)
@@ -67,6 +85,8 @@ async def run(*args, **kwargs) -> dict:
     provider, model = current()
     if model:
         kwargs["model"] = model
+    if kwargs.get("timeout") is None:
+        kwargs["timeout"] = resolve_timeout(provider)
     if provider == "codex":
         return await codex_runner.run(*args, **kwargs)
     return await claude_runner.run(*args, **kwargs)
@@ -83,6 +103,7 @@ def _selftest() -> None:
     assert normalize_provider("") == "claude"
     assert normalize_provider("cc") == "claude"
     assert normalize_provider("codex-cli") == "codex"
+    assert resolve_timeout("codex") >= resolve_timeout("claude")
     try:
         normalize_provider("x")
     except ValueError:
