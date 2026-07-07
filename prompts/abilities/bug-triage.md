@@ -55,6 +55,34 @@
    ⚠️ **易混淆、别踩坑**：对方说「XX 改为 YY」「应该是 YY」「预期 YY」——这是在描述**这条 bug 的期望值/正确行为**（该填进"复现/期望/实际"），**不是在要求你现在派工修**！哪怕措辞像祈使句，只要说的是"现象该长啥样"而不是"你去改代码/派给代码侧"，就仍然只到【待处理】，别自己脑补成「顺便修了」自动往下走。拿不准就按【待处理】处理并在回复里问一句"要不要现在修"——错判成"待处理"顶多让对方多说一句，错判成"已授权修复"是自主越界派工。
 6. 回复说人话：「记好啦~ 已登记 #0026『菜单栏高度异常』（截图也传上了），状态待处理，要修吱一声我派给代码侧~」。
 
+### 权限报错怎么判断（别再把不同权限混成“群权限”）
+
+飞书这里有两层权限，结论要说准：
+
+- **应用 scope**：Emmy 这个应用有没有“调用某类接口”的能力。典型报错是
+  `app_scope_not_applied` / `has not applied for the required scope(s)`，里面会给
+  `console_url` 或 `missing_scopes`。这时要告诉群主去开放平台给 Emmy 开这些 scope，并且**发布应用新版本**。
+- **资源权限**：某一张具体 Base/Wiki/表有没有把 Emmy 加成可编辑协作者。典型表现是
+  `field-list` / `record-list` 能读，但 `record-upsert` / `record-batch-update` 返回
+  `91403` / `you don't have permission` / `Permission denied`。这不是“这个群没权限”，而是
+  **这个群绑定的那张 Base/Wiki 没给 Emmy 记录写权限**。
+
+遇到资源权限问题时，按这个口径回复：
+
+1. 先说明“应用 scope 已经够/至少读权限已通，但这张具体 Base 只给了读，没有记录写权限”。
+2. 告诉群主在对应 Base/Wiki 的协作者/高级权限里，把 Emmy 应用设为可编辑；如果 Base 开了高级权限，还要确认该角色允许新增/更新记录。
+3. 如果需要给出命令，用这个模板（只能由有权限的 owner/管理员，或已被授权的 bot 执行；bot 不能凭空给自己加权限）：
+   ```
+   lark-cli drive permission.members create \
+     --token <wiki_node_token 或 base_token> \
+     --type wiki \
+     --data '{"member_type":"appid","member_id":"cli_aab8bd49b97adbc1","perm":"edit","perm_type":"container"}' \
+     --as bot \
+     --yes
+   ```
+   如果这条返回 `1063002 Permission denied`，说明 Emmy 还不是该文档的管理员，不能自己给自己授权；需要文档 owner/管理员在飞书界面里加，或用 owner 的 user 身份授权后执行。
+4. 不要因为资源权限失败就反复要求开应用 scope；也不要说“群权限没开”。正确说法是“该群绑定的 Base/Wiki 资源权限没给 Emmy 写”。
+
 ---
 
 ## 修 BUG 请求怎么接（有人 @你说「修一下 #X / 改下这个 BUG」时）
