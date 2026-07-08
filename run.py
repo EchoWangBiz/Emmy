@@ -54,12 +54,63 @@ _RESOURCE_TYPES = ("file", "post", "media")
 # 记录哪些 chat 已开过 session（用于 --resume 续聊）
 _seen_chats: set = set()
 
+# 群聊入口必须显式叫 Emmy。飞书长连接配置/权限变化后，im.message.receive_v1 可能推送普通群消息；
+# 框架必须在进队列前自己兜底，否则一个「?」也会触发 ack + 大脑 + BUG 登记。
+_BOT_NAMES = tuple(
+    n.strip() for n in os.environ.get("EMMY_BOT_NAMES", "Emmy,emmy,艾米").split(",") if n.strip()
+)
+_MENTION_TOKEN_RE = re.compile(r"<at\b[^>]*>(.*?)</at>|[＠@]([^\s:：,，;；)）]+)")
+
 # 私聊场景前缀：明确「私聊 = 正常的编程对话助手」，群里那套 BUG 工单流程别主动触发
 P2P_PREFIX = (
     "[私聊模式] 现在是和你单独聊天。你就是个聪明又靠谱的编程对话助手：问啥答啥、"
     "帮看代码、出主意、查问题都行。群里那套「BUG 工单 / 改多维表格 / 状态流转 / 群通知」"
     "流程在私聊里【不要主动触发】，除非对方明确要求。\n\n"
 )
+
+
+def _norm_mention_name(s: str) -> str:
+    """Normalize rendered mention text for robust @Emmy detection."""
+    return re.sub(r"[\s@：:,，;；)）]+", "", str(s or "")).strip().lower()
+
+
+def _content_addresses_emmy(content: str) -> bool:
+    """Return True only when group text explicitly mentions Emmy."""
+    if not content:
+        return False
+    names = {_norm_mention_name(n) for n in _BOT_NAMES}
+    for m in _MENTION_TOKEN_RE.finditer(content):
+        label = m.group(1) or m.group(2) or ""
+        norm = _norm_mention_name(label)
+        if norm in names or any(norm.startswith(n) for n in names if n):
+            return True
+    return False
+
+
+def _mentions_address_emmy(mentions) -> bool:
+    """Best-effort detection when Lark event contains structured mention data."""
+    names = {_norm_mention_name(n) for n in _BOT_NAMES}
+    items = mentions if isinstance(mentions, list) else [mentions]
+    for item in items:
+        if isinstance(item, dict):
+            values = [
+                item.get("name"), item.get("text"), item.get("tenant_key"),
+                item.get("user_name"), item.get("mention_name"),
+            ]
+        else:
+            values = [item]
+        for value in values:
+            norm = _norm_mention_name(value)
+            if norm in names:
+                return True
+    return False
+
+
+def _should_accept_message(msg: dict) -> bool:
+    """Ingress gate: p2p always; group messages must explicitly @ Emmy."""
+    if msg.get("chat_type") == "p2p":
+        return True
+    return _content_addresses_emmy(msg.get("content") or "") or _mentions_address_emmy(msg.get("mentions"))
 
 
 def load_system_prompt(include_abilities: bool = True) -> str:
@@ -558,8 +609,13 @@ class Debouncer:
         self._first_ts.pop(cid, None)
         if not msgs:
             return
+        merged = _merge_msgs(msgs)
+        if not _should_accept_message(merged):
+            print("[run] 忽略未 @Emmy 的群消息 chat=%s sender=%s"
+                  % (merged.get("chat_id"), merged.get("sender_id")), flush=True)
+            return
         try:
-            await self._flush(_merge_msgs(msgs))
+            await self._flush(merged)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 —— fire-and-forget task 自己兜底，别变成 "Task exception never retrieved"
