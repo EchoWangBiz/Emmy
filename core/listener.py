@@ -8,8 +8,8 @@ core/listener.py —— 飞书事件监听
 im.message.receive_v1 事件结构（本机 `lark-cli event schema` 确认）：
   chat_id / chat_type(p2p|group) / content(预渲染文本) / event_id /
   message_id / sender_id / message_type / timestamp
-  —— 没有 mentions 字段；群 @机器人 由 scope(group_at_msg) 决定是否推送，
-     所以收到的事件即「该 Emmy 处理」的（p2p 直发 + group @机器人）。
+  部分环境会推送普通群消息，不一定只推 @机器人；run.py 会在进队列前再次判断
+  「私聊或显式 @Emmy」才处理。
 """
 from __future__ import annotations
 
@@ -76,6 +76,7 @@ def to_message(event: dict) -> Optional[dict]:
         "message_id": src.get("message_id") or src.get("id"),
         "sender_id": src.get("sender_id"),
         "message_type": src.get("message_type"),
+        "mentions": src.get("mentions") or src.get("mention") or [],
     }
 
 
@@ -148,6 +149,7 @@ def _selftest() -> None:
     msg = to_message(ev)
     assert msg is not None and msg["chat_id"] == "oc_a", msg
     assert msg["content"].startswith("@Emmy") and msg["chat_type"] == "group", msg
+    assert msg["mentions"] == [], msg
     print("✓ 解析 + 字段提取")
 
     # 2) 兼容包在 event 键下的结构
