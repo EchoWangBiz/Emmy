@@ -23,6 +23,7 @@ import random
 import re
 import sys
 import time
+import traceback
 from urllib.parse import parse_qs, urlparse
 from typing import Optional
 
@@ -47,6 +48,7 @@ ACK_REPLIES = [
 
 # 收到既没文字又没可读文件时的温和兜底（图片/贴纸/读不了的文件，别静默）
 EMPTY_TIP = "我现在只看得懂文字和文本类文件哦~ 图片之类的先用文字跟我说说要干嘛呀 🦊"
+NONACTIONABLE_TIP = "我没看懂你要我做啥呀~ 直接说「记个 BUG」或「修一下 #编号」就行 🦊"
 
 # 可能携带可下载文件资源的消息类型（飞书「文字+拖文件」常是 post 富文本，不只 file）
 _RESOURCE_TYPES = ("file", "post", "media")
@@ -60,6 +62,8 @@ _BOT_NAMES = tuple(
     n.strip() for n in os.environ.get("EMMY_BOT_NAMES", "Emmy,emmy,艾米").split(",") if n.strip()
 )
 _MENTION_TOKEN_RE = re.compile(r"<at\b[^>]*>(.*?)</at>|[＠@]([^\s:：,，;；)）]+)")
+_LEADING_MENTION_TOKEN_RE = re.compile(r"^\s*(?:<at\b[^>]*>(.*?)</at>|[＠@]([^\s:：,，;；)）]+))", re.S)
+_MEANINGFUL_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]")
 
 # 私聊场景前缀：明确「私聊 = 正常的编程对话助手」，群里那套 BUG 工单流程别主动触发
 P2P_PREFIX = (
@@ -111,6 +115,28 @@ def _should_accept_message(msg: dict) -> bool:
     if msg.get("chat_type") == "p2p":
         return True
     return _content_addresses_emmy(msg.get("content") or "") or _mentions_address_emmy(msg.get("mentions"))
+
+
+def _strip_leading_bot_mentions(content: str) -> str:
+    """Remove leading @Emmy tokens from the actual instruction text."""
+    text = str(content or "")
+    names = {_norm_mention_name(n) for n in _BOT_NAMES}
+    while True:
+        m = _LEADING_MENTION_TOKEN_RE.match(text)
+        if not m:
+            return text.strip()
+        label = m.group(1) or m.group(2) or ""
+        norm = _norm_mention_name(label)
+        if norm not in names and not any(norm.startswith(n) for n in names if n):
+            return text.strip()
+        text = text[m.end():]
+        text = re.sub(r"^\s*[:：,，;；]+", "", text, count=1)
+
+
+def _is_nonactionable_text(content: str) -> bool:
+    """Tiny punctuation-only messages should not reach the brain or BUG table."""
+    text = _strip_leading_bot_mentions(content)
+    return bool(text) and not _MEANINGFUL_RE.search(text)
 
 
 def load_system_prompt(include_abilities: bool = True) -> str:
@@ -450,6 +476,8 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     is_p2p = msg.get("chat_type") == "p2p"
     cc = None if is_p2p else config.chat_config(chat_id)
     at = None if is_p2p else (sender_id or None)   # 群聊回复 @ 回发言人（区分这话是冲谁说的）；私聊不 @
+    if not is_p2p:
+        content = _strip_leading_bot_mentions(content)
 
     # 纯空消息（既没文字、又没文件、也没转发记录）→ 温和提示，不 ack、不调 claude
     if not content and not file_ids and not fwd_ids:
@@ -477,6 +505,9 @@ async def handle(msg: dict, system_prompt: str, system_prompt_p2p: str) -> None:
     # 读完文件仍没有任何可用内容（图片/读不了的文件且无文字）→ 温和提示
     if not content:
         await reply.send(chat_id, EMPTY_TIP, idempotency_key=msg.get("event_id"), at_user_id=at)
+        return
+    if not is_p2p and _is_nonactionable_text(content):
+        await reply.send(chat_id, NONACTIONABLE_TIP, idempotency_key=msg.get("event_id"), at_user_id=at)
         return
 
     # 续聊判定按「群+发言人」：同群不同人各自独立 session（brain 适配器也按发言人派生 session_id）
@@ -679,8 +710,16 @@ class ChatDispatcher:
                         self._active.discard(key)
             except Exception as e:      # 单条失败不拖垮该发言人、更不拖垮别人
                 print(f"[run] handle error ({key}): {e}", flush=True)
+                try:
+                    os.makedirs(WORKER_LOG_DIR, exist_ok=True)
+                    with open(os.path.join(WORKER_LOG_DIR, "run-error.log"), "a", encoding="utf-8") as f:
+                        f.write("\n[%s] handle error key=%s event=%s\n" % (
+                            time.strftime("%Y-%m-%d %H:%M:%S"), key, msg.get("event_id")))
+                        f.write(traceback.format_exc())
+                except Exception:
+                    pass
                 try:  # 别让用户「没后续」——出错也回一句，至少有反馈（群聊 @ 回发言人）
-                    await reply.send(msg["chat_id"], "哎呀我这边卡了一下下，稍后再喊我一次试试？🙏",
+                    await reply.send(msg["chat_id"], "我这边刚刚卡住了，日志已经记下来了；稍后再喊我一次试试哈~",
                                      idempotency_key=(msg.get("event_id") or "") + ":err",
                                      at_user_id=(msg.get("sender_id") if msg.get("chat_type") != "p2p" else None))
                 except Exception:
