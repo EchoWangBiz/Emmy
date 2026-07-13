@@ -25,7 +25,10 @@ PIPE = asyncio.subprocess.PIPE
 
 _NS = uuid.UUID("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
 _SESSION_FILE = os.path.expanduser("~/.emmy/codex_sessions.json")
-_CODEX_APP_BIN = "/Applications/Codex.app/Contents/Resources/codex"
+_CODEX_APP_BINS = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+)
 DEFAULT_SANDBOX = "danger-full-access"
 
 CODEX_SYSTEM_PREFIX = (
@@ -67,13 +70,18 @@ def _compose_prompt(prompt: str, system_prompt: str = "") -> str:
 
 
 def codex_bin(env: Optional[dict] = None) -> str:
-    """定位 Codex CLI。优先 PATH，macOS 上 fallback 到 Codex.app 内置二进制。"""
-    path = (env or os.environ).get("PATH")
+    """定位 Codex CLI。优先显式配置/PATH，macOS 上 fallback 到 App 内置二进制。"""
+    source = env or os.environ
+    explicit = source.get("EMMY_CODEX_BIN") or source.get("CODEX_BIN")
+    if explicit:
+        return explicit
+    path = source.get("PATH")
     found = shutil.which("codex", path=path)
     if found:
         return found
-    if os.path.exists(_CODEX_APP_BIN):
-        return _CODEX_APP_BIN
+    for candidate in _CODEX_APP_BINS:
+        if os.path.exists(candidate):
+            return candidate
     return "codex"
 
 
@@ -182,10 +190,19 @@ async def _invoke(
         proc_env["PATH"] = os.path.join(cwd, "bin") + os.pathsep + proc_env.get("PATH", "")
     sandbox = proc_env.get("EMMY_CODEX_SANDBOX") or DEFAULT_SANDBOX
     skip_git_repo_check = proc_env.get("EMMY_CODEX_SKIP_GIT_REPO_CHECK", "").lower() in ("1", "true", "yes")
+    codex_path = codex_bin(proc_env)
     cmd = build_cmd(prompt, thread_id=thread_id, cwd=cwd, model=model,
-                    sandbox=sandbox, codex_path=codex_bin(proc_env),
+                    sandbox=sandbox, codex_path=codex_path,
                     skip_git_repo_check=skip_git_repo_check)
-    proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=proc_env, stdout=PIPE, stderr=PIPE)
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=proc_env, stdout=PIPE, stderr=PIPE)
+    except FileNotFoundError:
+        return {"ok": False, "is_error": True,
+                "text": "（找不到 Codex CLI，请设置 EMMY_CODEX_BIN 或安装/打开 ChatGPT/Codex App）",
+                "error": "codex CLI not found: %s" % codex_path,
+                "session_id": thread_id, "cost_usd": 0.0, "returncode": 127,
+                "raw_stdout": "", "raw_stderr": "codex CLI not found: %s" % codex_path,
+                "raw_stdout_tail": "", "raw_stderr_tail": ""}
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -271,7 +288,7 @@ def _selftest() -> None:
     assert cmd4[3] == "read-only"
     cmd5 = build_cmd("hi", skip_git_repo_check=True)
     assert "--skip-git-repo-check" in cmd5
-    assert codex_bin({"PATH": "/no/such/path"}) in ("codex", _CODEX_APP_BIN)
+    assert codex_bin({"PATH": "/no/such/path"}) in ("codex", *_CODEX_APP_BINS)
     print("✓ codex build_cmd 新建/续聊")
 
     out = "\n".join([
